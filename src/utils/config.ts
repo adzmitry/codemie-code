@@ -73,7 +73,7 @@ export class ConfigLoader {
   private static async loadConfigByScope(scope: StorageScope, workingDir: string): Promise<MultiProviderConfig> {
     return scope === StorageScope.GLOBAL
       ? this.loadMultiProviderConfig()
-      : this.loadLocalMultiProviderConfig(workingDir);
+      : this.readLocalConfigForWrite(workingDir);
   }
 
   private static async saveConfigByScope(scope: StorageScope, workingDir: string, config: MultiProviderConfig): Promise<void> {
@@ -587,14 +587,105 @@ export class ConfigLoader {
     }
 
     if (Object.keys(rawConfig).length === 0) {
+      // No local file: no local profile choice — the global active profile applies.
       return {
         version: 2,
-        activeProfile: 'default',
+        activeProfile: '',
         profiles: {}
       };
     }
 
     throw new ConfigurationError(`Unrecognized config format at ${localConfigPath}. Expected multi-provider (version 2) format.`);
+  }
+
+  /**
+   * Read-modify-write the local config. Every key the mutation does not touch is
+   * kept; a file that cannot be classified safely is refused and left unchanged.
+   */
+  static async updateLocalConfig(
+    workingDir: string,
+    mutate: (config: MultiProviderConfig) => void
+  ): Promise<MultiProviderConfig> {
+    const config = await this.readLocalConfigForWrite(workingDir);
+    mutate(config);
+    await this.saveLocalMultiProviderConfig(workingDir, config);
+    return config;
+  }
+
+  /**
+   * Load the local config for a write. A missing file yields an empty v2 config
+   * with no local profile choice (activeProfile '').
+   */
+  private static async readLocalConfigForWrite(workingDir: string): Promise<MultiProviderConfig> {
+    const localConfigPath = path.join(workingDir, this.LOCAL_CONFIG);
+    let content: string;
+    try {
+      content = await fs.readFile(localConfigPath, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        return { version: 2, activeProfile: '', profiles: {} };
+      }
+      throw error;
+    }
+
+    let raw: unknown;
+    try {
+      // Strip a UTF-8 BOM some Windows editors add.
+      raw = JSON.parse(content.charCodeAt(0) === 0xfeff ? content.slice(1) : content);
+    } catch {
+      throw this.unsupportedLocalConfig(localConfigPath, 'invalid JSON');
+    }
+
+    return this.classifyLocalConfigForWrite(raw, localConfigPath);
+  }
+
+  /**
+   * Accept a valid v2 config as-is, fill a partial non-legacy object (e.g. a
+   * hand-written assistants/workspace-only file), and refuse everything else.
+   */
+  private static classifyLocalConfigForWrite(raw: unknown, configPath: string): MultiProviderConfig {
+    if (isMultiProviderConfig(raw)) {
+      return raw;
+    }
+
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw this.unsupportedLocalConfig(configPath, 'not a JSON object');
+    }
+
+    const candidate = raw as Record<string, unknown>;
+    if (isLegacyConfig(raw)) {
+      throw this.unsupportedLocalConfig(configPath, 'legacy single-provider format');
+    }
+    if (candidate.version !== undefined && candidate.version !== 2) {
+      throw this.unsupportedLocalConfig(configPath, `unsupported version ${String(candidate.version)}`);
+    }
+
+    const profiles = candidate.profiles;
+    const profilesValid = profiles === undefined || (
+      profiles !== null
+      && typeof profiles === 'object'
+      && !Array.isArray(profiles)
+      && Object.values(profiles).every(p => p !== null && typeof p === 'object' && !Array.isArray(p))
+    );
+    if (!profilesValid) {
+      throw this.unsupportedLocalConfig(configPath, '"profiles" must be an object of profile objects');
+    }
+    if (candidate.activeProfile !== undefined && typeof candidate.activeProfile !== 'string') {
+      throw this.unsupportedLocalConfig(configPath, '"activeProfile" must be a string');
+    }
+
+    return {
+      ...candidate,
+      version: 2,
+      activeProfile: (candidate.activeProfile as string | undefined) ?? '',
+      profiles: (profiles as MultiProviderConfig['profiles'] | undefined) ?? {}
+    } as MultiProviderConfig;
+  }
+
+  private static unsupportedLocalConfig(configPath: string, reason: string): ConfigurationError {
+    return new ConfigurationError(
+      `Local config ${configPath} has an unsupported format (${reason}); it was left unchanged.`
+    );
   }
 
   /**
