@@ -60,7 +60,7 @@ project context, but it cannot replace the selected provider, model, or credenti
 | Differently named local profile; URLs differ | global (selected profile) | global (selected profile) |
 | `--profile <name>` with a same-named local profile | local overlay | local overlay |
 
-**Key rule**: Profile names are unique across the system. `profile switch` stores the active profile selection in local config when `.codemie/` exists (for this repository only), or in global config otherwise; the referenced profile can be defined in either global or local scope. `profile delete` deletes from whichever scope (global or local) defines the profile, and repairs any active profile references.
+**Key rule**: Cross-scope uniqueness of profile names is not enforced; when the same name exists in both scopes, the local profile wins (`getProfileScope()` resolves local first). `codemie setup` and `profile rename` reject a name that already exists in this directory's local or global scope. `profile switch` stores the active profile selection in local config when `.codemie/` exists (for this repository only), or in global config otherwise; the referenced profile can be defined in either global or local scope. `profile delete` deletes from whichever scope (global or local) defines the profile, and repairs the active profile references in the global config and in this directory's local config (local configs of other repositories are not touched; the fallback warning below covers them).
 
 **Local config writes and profile scope rules**:
 
