@@ -787,6 +787,50 @@ export class ConfigLoader {
   }
 
   /**
+   * Add or update a profile in the local config, keeping every other local
+   * profile and key. The workspace half is merged into the local workspace.
+   *
+   * The profile becomes active when the local activeProfile is '' or names a
+   * profile that exists in neither scope; an added profile also becomes active
+   * when it is the only local profile. Otherwise the local choice is kept.
+   */
+  static async saveLocalProfile(
+    workingDir: string,
+    profileName: string,
+    input: Partial<CodeMieConfigOptions>,
+    options: { isUpdate: boolean }
+  ): Promise<{ activated: boolean }> {
+    // Top-level-only fields must not live inside a profile.
+    const cleanInput: Record<string, unknown> = { ...input };
+    delete cleanInput.codemieSkills;
+    delete cleanInput.codemieAssistants;
+    const { profile: profileFields, workspace: workspaceFields } = this.splitProfileAndWorkspace(
+      cleanInput as Partial<CodeMieConfigOptions>
+    );
+    const globalProfiles = (await this.loadMultiProviderConfig()).profiles;
+    let activated = false;
+
+    await this.updateLocalConfig(workingDir, config => {
+      config.profiles[profileName] = { ...this.removeUndefined(profileFields), name: profileName } as ProviderProfile;
+
+      const definedWorkspace = this.removeUndefined(workspaceFields);
+      if (Object.keys(definedWorkspace).length > 0) {
+        config.workspace = { ...config.workspace, ...definedWorkspace };
+      }
+
+      const current = config.activeProfile;
+      const currentMissing = !current || (!config.profiles[current] && !globalProfiles[current]);
+      const onlyLocalProfile = Object.keys(config.profiles).length === 1;
+      if (currentMissing || (!options.isUpdate && onlyLocalProfile)) {
+        config.activeProfile = profileName;
+        activated = true;
+      }
+    });
+
+    return { activated };
+  }
+
+  /**
    * Delete a profile
    * Deletes from the scope that defines the requested profile.
    */

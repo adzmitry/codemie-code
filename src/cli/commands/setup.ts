@@ -308,36 +308,27 @@ async function handlePluginSetup(
       const workingDir = process.cwd();
 
       if (storageLocation === 'local') {
-        // Save to local .codemie/ directory
-        await ConfigLoader.initProjectConfig(workingDir, {
-          profileName: finalProfileName!,
-          ...config
-        });
+        // Merge into the local .codemie/ config, keeping other profiles and keys
+        const { activated } = await ConfigLoader.saveLocalProfile(workingDir, finalProfileName!, config, { isUpdate });
 
         const configPath = `${workingDir}/.codemie/codemie-cli.config.json`;
         saveSpinner.succeed(chalk.green(`Profile "${finalProfileName}" saved to local config`));
         console.log(chalk.dim(`  Location: ${configPath}`));
 
-        // For local configs, the profile is automatically active if it's the only one or if it's being created
-        // Check if we should prompt to activate it
-        if (!isUpdate) {
-          const profiles = await ConfigLoader.listProfiles(workingDir);
-          const activeProfile = await ConfigLoader.getActiveProfileName(workingDir);
-
-          if (profiles.length > 1 && activeProfile !== finalProfileName) {
-            const { switchToNew } = await inquirer.prompt([
-              {
-                type: 'confirm',
-                name: 'switchToNew',
-                message: `Switch to profile "${finalProfileName}" as active in local config?`,
-                default: true
-              }
-            ]);
-
-            if (switchToNew) {
-              await ConfigLoader.switchProfile(finalProfileName!, workingDir);
-              console.log(chalk.green(`✓ Switched to profile "${finalProfileName}" in local config`));
+        // A new profile that did not become active on its own: ask whether to switch
+        if (!isUpdate && !activated) {
+          const { switchToNew } = await inquirer.prompt([
+            {
+              type: 'confirm',
+              name: 'switchToNew',
+              message: `Switch to profile "${finalProfileName}" as active in local config?`,
+              default: true
             }
+          ]);
+
+          if (switchToNew) {
+            await ConfigLoader.switchProfile(finalProfileName!, workingDir);
+            console.log(chalk.green(`✓ Switched to profile "${finalProfileName}" in local config`));
           }
         }
       } else {

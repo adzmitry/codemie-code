@@ -228,4 +228,133 @@ describe('ConfigLoader local config writes', () => {
       expect(profiles.filter(p => p.active).map(p => p.name)).toEqual(['work']);
     });
   });
+
+  describe('saveLocalProfile', () => {
+    const TEAM_LOCAL = {
+      version: 2,
+      activeProfile: 'team',
+      profiles: {
+        team: { name: 'team', provider: 'sso', model: 'a' },
+        other: { name: 'other', provider: 'litellm', model: 'b' }
+      },
+      codemieAssistants: [{ slug: 'jira' }],
+      codemieSkills: [{ slug: 's' }],
+      workspace: { codeMieProject: 'p', hooks: { x: 1 } }
+    };
+
+    it('update keeps other profiles, keys and the active profile', async () => {
+      await writeLocal(TEAM_LOCAL);
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'other',
+        { provider: 'litellm', model: 'm', codeMieProject: 'q' },
+        { isUpdate: true }
+      );
+
+      const local = await readLocal() as typeof TEAM_LOCAL;
+      expect(result).toEqual({ activated: false });
+      expect(local.profiles.team).toEqual(TEAM_LOCAL.profiles.team);
+      expect(local.profiles.other).toEqual({ name: 'other', provider: 'litellm', model: 'm' });
+      expect(local.workspace).toEqual({ codeMieProject: 'q', hooks: { x: 1 } });
+      expect(local.activeProfile).toBe('team');
+      expect(local.codemieAssistants).toEqual(TEAM_LOCAL.codemieAssistants);
+      expect(local.codemieSkills).toEqual(TEAM_LOCAL.codemieSkills);
+    });
+
+    it('add when other local profiles exist does not activate', async () => {
+      await writeLocal(TEAM_LOCAL);
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'third',
+        { provider: 'litellm', model: 'c' },
+        { isUpdate: false }
+      );
+
+      const local = await readLocal() as typeof TEAM_LOCAL;
+      expect(result).toEqual({ activated: false });
+      expect(local.activeProfile).toBe('team');
+      expect(Object.keys(local.profiles)).toEqual(['team', 'other', 'third']);
+    });
+
+    it('add as the only local profile activates', async () => {
+      await fs.rm(LOCAL_CONFIG_PATH, { force: true });
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'solo',
+        { provider: 'litellm', model: 'c' },
+        { isUpdate: false }
+      );
+
+      expect(result).toEqual({ activated: true });
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: 'solo',
+        profiles: { solo: { name: 'solo', provider: 'litellm', model: 'c' } }
+      });
+    });
+
+    it('update activates when the local active is dangling', async () => {
+      await writeLocal({ ...TEAM_LOCAL, activeProfile: 'gone' });
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'other',
+        { provider: 'litellm', model: 'm' },
+        { isUpdate: true }
+      );
+
+      expect(result).toEqual({ activated: true });
+      expect((await readLocal()).activeProfile).toBe('other');
+    });
+
+    it('update does not activate when the local active is a valid global profile', async () => {
+      await writeLocal({ ...TEAM_LOCAL, activeProfile: 'personal' });
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'other',
+        { provider: 'litellm', model: 'm' },
+        { isUpdate: true }
+      );
+
+      expect(result).toEqual({ activated: false });
+      expect((await readLocal()).activeProfile).toBe('personal');
+    });
+
+    it('add into a fill-shape file keeps assistants/workspace', async () => {
+      await writeLocal({ codemieAssistants: [{ slug: 'jira' }], workspace: { codeMieProject: 'p' } });
+
+      const result = await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'team',
+        { provider: 'sso', model: 'a' },
+        { isUpdate: false }
+      );
+
+      expect(result).toEqual({ activated: true });
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: 'team',
+        profiles: { team: { name: 'team', provider: 'sso', model: 'a' } },
+        codemieAssistants: [{ slug: 'jira' }],
+        workspace: { codeMieProject: 'p' }
+      });
+    });
+
+    it('strips codemieSkills/codemieAssistants from the profile entry', async () => {
+      await fs.rm(LOCAL_CONFIG_PATH, { force: true });
+
+      await ConfigLoader.saveLocalProfile(
+        WORKING_DIR,
+        'solo',
+        { provider: 'sso', codemieSkills: [], codemieAssistants: [] } as never,
+        { isUpdate: false }
+      );
+
+      expect((await readLocal() as typeof TEAM_LOCAL).profiles.solo).toEqual({ name: 'solo', provider: 'sso' });
+    });
+  });
 });
