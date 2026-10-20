@@ -624,24 +624,14 @@ export class ConfigLoader {
     };
   }
 
+  /**
+   * Load the local config for a caller that will write it back (migrations).
+   * Uses the same classifier as updateLocalConfig(): a missing file yields an
+   * empty v2 config with no local profile choice, a partial file is filled, and
+   * an unreadable file is refused instead of being read as empty and overwritten.
+   */
   static async loadLocalMultiProviderConfig(workingDir: string): Promise<MultiProviderConfig> {
-    const localConfigPath = path.join(workingDir, this.LOCAL_CONFIG);
-    const rawConfig = await this.loadJsonConfig(localConfigPath);
-
-    if (isMultiProviderConfig(rawConfig)) {
-      return rawConfig;
-    }
-
-    if (Object.keys(rawConfig).length === 0) {
-      // No local file: no local profile choice — the global active profile applies.
-      return {
-        version: 2,
-        activeProfile: '',
-        profiles: {}
-      };
-    }
-
-    throw new ConfigurationError(`Unrecognized config format at ${localConfigPath}. Expected multi-provider (version 2) format.`);
+    return this.readLocalConfigForWrite(workingDir);
   }
 
   /**

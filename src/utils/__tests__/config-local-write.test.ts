@@ -573,3 +573,46 @@ describe('ConfigLoader global config writes', () => {
     expect(Object.keys(saved.profiles).sort()).toEqual(['default', 'new']);
   });
 });
+
+describe('local config migrations', () => {
+  const HOME_DIR = path.join(TEST_DIR, '.codemie');
+  const DIR = path.join(TEST_DIR, 'project');
+  const LOCAL_PATH = path.join(DIR, '.codemie', 'codemie-cli.config.json');
+
+  beforeEach(async () => {
+    await fs.mkdir(HOME_DIR, { recursive: true });
+    await fs.mkdir(path.dirname(LOCAL_PATH), { recursive: true });
+    vi.spyOn(paths, 'getCodemieHome').mockReturnValue(HOME_DIR);
+    vi.spyOn(paths, 'getCodemiePath').mockImplementation((subpath: string) => path.join(HOME_DIR, subpath));
+    vi.spyOn(process, 'cwd').mockReturnValue(DIR);
+    await fs.writeFile(path.join(HOME_DIR, 'codemie-cli.config.json'), JSON.stringify(GLOBAL_CONFIG));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(TEST_DIR, { recursive: true, force: true });
+  });
+
+  it('loadLocalMultiProviderConfig refuses an unparseable local file', async () => {
+    await fs.writeFile(LOCAL_PATH, '{not json');
+
+    await expect(ConfigLoader.loadLocalMultiProviderConfig(DIR)).rejects.toThrow(ConfigurationError);
+  });
+
+  it('loadLocalMultiProviderConfig reads a BOM-prefixed v2 file', async () => {
+    const config = { version: 2, activeProfile: 'a', profiles: { a: { provider: 'sso' } } };
+    await fs.writeFile(LOCAL_PATH, String.fromCharCode(0xfeff) + JSON.stringify(config));
+
+    await expect(ConfigLoader.loadLocalMultiProviderConfig(DIR)).resolves.toEqual(config);
+  });
+
+  it('migration 004 leaves an unparseable local file byte-identical', async () => {
+    const content = '{"version":2,"profiles":{"team":{"provider":"sso"}},';
+    await fs.writeFile(LOCAL_PATH, content);
+    const { SkillsAssistantsTopLevelMigration } = await import('../../migrations/004-skills-assistants-top-level.migration.js');
+
+    await new SkillsAssistantsTopLevelMigration().up().catch(() => undefined);
+
+    expect(await fs.readFile(LOCAL_PATH, 'utf-8')).toBe(content);
+  });
+});
