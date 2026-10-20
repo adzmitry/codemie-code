@@ -4,10 +4,9 @@
  * Handles all data fetching for skills setup
  */
 
-import type { SkillListItem, SkillDetail, CodeMieClient } from 'codemie-sdk';
+import { NotFoundError, type SkillListItem, type SkillDetail, type CodeMieClient } from 'codemie-sdk';
 import { logger } from '@/utils/logger.js';
 import type { CodemieSkill } from '@/env/types.js';
-import { RegistrationItemNotFoundError } from '@/utils/errors.js';
 import { assertApiListResponse } from '@/cli/commands/shared/api-response-guard.js';
 
 type ApiSkillScope = 'project' | 'marketplace';
@@ -48,6 +47,16 @@ function isSkillListResponse(response: unknown): response is SkillListResponse {
     && typeof r.total === 'number' && typeof r.pages === 'number';
 }
 
+function isSkillDetailResponse(response: unknown): response is SkillDetail {
+  const r = response as Partial<SkillDetail> | null | undefined;
+  return !!r && typeof r === 'object' && typeof r.id === 'string';
+}
+
+export interface FetchSkillsByIdsResult {
+  found: SkillDetail[];
+  missing: string[];
+}
+
 export interface FetchSkillsParams {
   scope: 'registered' | 'project' | 'marketplace';
   searchQuery?: string;
@@ -63,7 +72,7 @@ export interface FetchSkillsResult {
 export interface SkillDataFetcher {
   fetchSkills: (params: FetchSkillsParams) => Promise<FetchSkillsResult>;
   fetchSkillById: (id: string) => Promise<SkillDetail>;
-  fetchSkillsByIds: (ids: string[], registeredSkills: CodemieSkill[]) => Promise<SkillListItem[]>;
+  fetchSkillsByIds: (ids: string[], registeredSkills: CodemieSkill[]) => Promise<FetchSkillsByIdsResult>;
   fetchAllVisibleSkills: () => Promise<SkillListItem[]>;
 }
 
@@ -184,32 +193,42 @@ export function createSkillDataFetcher(config: SkillDataFetcherConfig): SkillDat
     return skills;
   }
 
-  async function fetchSkillsByIds(ids: string[], _registeredSkills: CodemieSkill[]): Promise<SkillListItem[]> {
+  async function fetchSkillsByIds(ids: string[], _registeredSkills: CodemieSkill[]): Promise<FetchSkillsByIdsResult> {
     if (ids.length === 0) {
-      return [];
+      return { found: [], missing: [] };
     }
 
     logger.debug('[SkillSetup] Fetching skills by IDs', { ids });
 
-    // No efficient bulk-by-id endpoint, so fetch every visible skill (paged) and
-    // resolve each requested id against it. A requested id the catalog does not
-    // contain aborts the run: filtering it out silently reports success for a
-    // skill that was never registered.
-    const allSkills = await fetchAllVisibleSkills();
-    const byId = new Map(allSkills.map(skill => [skill.id, skill]));
-
-    const skills = ids.map((id) => {
-      const skill = byId.get(id);
-
-      if (!skill) {
-        throw new RegistrationItemNotFoundError('skill', id);
+    // Fetch each requested id directly rather than crawling the whole catalog: the
+    // visible catalog runs to thousands of skills, and paging through it took
+    // longer than 30s with no output. An id the API does not know is reported in
+    // `missing` for the caller to decide on; any other failure propagates.
+    const results = await Promise.all(ids.map(async (id): Promise<SkillDetail | { missing: string }> => {
+      try {
+        const skill: unknown = await client.skills.get(id);
+        assertApiListResponse(skill, isSkillDetailResponse, 'skill details');
+        return skill;
+      } catch (error) {
+        if (error instanceof NotFoundError) {
+          return { missing: id };
+        }
+        throw error;
       }
+    }));
 
-      return skill;
-    });
+    const found: SkillDetail[] = [];
+    const missing: string[] = [];
+    for (const result of results) {
+      if ('missing' in result) {
+        missing.push(result.missing);
+      } else {
+        found.push(result);
+      }
+    }
 
-    logger.debug('[SkillSetup] Fetched skills by IDs', { count: skills.length });
-    return skills;
+    logger.debug('[SkillSetup] Fetched skills by IDs', { count: found.length, missing });
+    return { found, missing };
   }
 
   return { fetchSkills, fetchSkillById, fetchSkillsByIds, fetchAllVisibleSkills };

@@ -35,6 +35,12 @@ import {
 
 const GATEWAY_KEY = 'test-local-key';
 const PROFILE_MODEL = 'profile-selected-model-that-must-not-be-used';
+// Neutral unknown: no gpt-/claude-/codex prefix, so buildDefaultVsCodeCapability
+// falls back to conservative chat-completions defaults.
+const UNKNOWN_CHAT_MODEL = 'totally-unknown-model';
+// Responses unknown: gpt-7 major guarantees Responses defaults via
+// isResponsesOnlyGpt, while the segment never matches a capability-table family.
+const UNKNOWN_RESPONSES_MODEL = 'gpt-7-future-unknown-xyz';
 
 interface StartedServer {
   server: Server;
@@ -207,10 +213,12 @@ describe('VS Code BYOK model matrix', () => {
       // serve it directly from every family in the capability table so each
       // entry resolves as an exact match — the model matrix below then
       // exercises the request-forwarding behavior, not the resolver itself.
+      // Two extra ids with no capability family must still be written:
+      // a neutral chat-completions fallback and a Responses fallback.
       if (req.url?.startsWith('/v1/llm_models')) {
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({
-          data: VS_CODE_CAPABILITY_TABLE.map(entry => ({ id: entry.family })),
+          data: [...VS_CODE_CAPABILITY_TABLE.map(entry => ({ id: entry.family })), { id: UNKNOWN_CHAT_MODEL }, { id: UNKNOWN_RESPONSES_MODEL }],
         }));
         return;
       }
@@ -238,8 +246,17 @@ describe('VS Code BYOK model matrix', () => {
       provider => provider.name === 'CodeMie' && provider.vendor === 'customendpoint'
     );
 
-    expect(codeMieProvider?.models).toHaveLength(VS_CODE_CAPABILITY_TABLE.length);
+    expect(codeMieProvider?.models).toHaveLength(VS_CODE_CAPABILITY_TABLE.length + 2);
     expect(codeMieProvider?.models?.some(model => model.id === PROFILE_MODEL)).toBe(false);
+    expect(codeMieProvider?.models?.find(model => model.id === UNKNOWN_CHAT_MODEL)).toMatchObject({
+      id: UNKNOWN_CHAT_MODEL,
+      apiType: 'chat-completions',
+    });
+    expect(codeMieProvider?.models?.find(model => model.id === UNKNOWN_RESPONSES_MODEL)).toMatchObject({
+      id: UNKNOWN_RESPONSES_MODEL,
+      apiType: 'responses',
+      zeroDataRetentionEnabled: true,
+    });
 
     for (const definition of VS_CODE_CAPABILITY_TABLE) {
       const configuredModel = codeMieProvider?.models?.find(model => model.id === definition.family);

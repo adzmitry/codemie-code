@@ -11,6 +11,7 @@ import os from 'node:os';
 import { logger } from './logger.js';
 import { exec, type ExecOptions, type ExecResult } from './exec.js';
 import { extractRepository } from './paths.js';
+import { getNpmPrefixArgs } from '@/utils/npm-prefix.js';
 
 const execAsync = promisify(childProcessExec);
 
@@ -106,6 +107,16 @@ export interface DetachedSpawnOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   stdio?: 'ignore' | 'inherit';
+  windowsHide?: boolean;
+}
+
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function spawnDetached(
@@ -118,6 +129,12 @@ export function spawnDetached(
     env: options.env,
     detached: true,
     stdio: options.stdio ?? 'ignore',
+    windowsHide: options.windowsHide,
+  });
+  // A failed spawn emits 'error' on the next tick; unhandled, it crashes the process.
+  // The caller learns of the failure from the missing pid (-1).
+  child.on('error', (error) => {
+    logger.debug(`[spawnDetached] Failed to spawn ${command}:`, error);
   });
   child.unref();
   return child.pid ?? -1;
@@ -157,7 +174,7 @@ export async function installGlobal(
       shell: isWindows // npm is a .cmd file on Windows
     };
 
-    const args = ['install', '-g'];
+    const args = ['install', '-g', ...(await getNpmPrefixArgs())];
     if (options.force) {
       args.push('--force');
     }
@@ -207,7 +224,8 @@ export async function uninstallGlobal(
       shell: isWindows // npm is a .cmd file on Windows
     };
 
-    const result = await exec('npm', ['uninstall', '-g', packageName], execOptions);
+    const args = ['uninstall', '-g', ...(await getNpmPrefixArgs()), packageName];
+    const result = await exec('npm', args, execOptions);
 
     if (result.code !== 0) {
       throw new Error(
@@ -252,7 +270,8 @@ export async function listGlobal(
       shell: isWindows // npm is a .cmd file on Windows
     };
 
-    const result = await exec('npm', ['list', '-g', packageName], execOptions);
+    const args = ['list', '-g', ...(await getNpmPrefixArgs()), packageName];
+    const result = await exec('npm', args, execOptions);
     // Exit code 0 = installed, 1 = not found, >1 = error
     return result.code === 0;
   } catch {
@@ -388,20 +407,139 @@ export async function npxRun(
 // ============================================================================
 
 /**
- * Detect canonical repository identifier from git remote origin URL.
+ * Parse a git remote origin URL into a canonical, lower-cased repository identifier.
+ * Supports HTTPS/SSH `scheme://` URLs, SCP-style and SSH-alias remotes (`user@host:path`,
+ * `host:path`), and bare filesystem paths; strips Azure DevOps's `_git`/`v3` markers and a
+ * Bitbucket Server `scm/` context-path prefix; preserves arbitrary-depth GitLab subgroups.
+ *
+ * @param remoteUrl - The raw remote URL, as returned by `git remote get-url origin`
+ * @returns The repository identifier, or undefined if the URL carries no usable repository path
+ */
+function parseGitRemoteUrl(remoteUrl: string): string | undefined {
+  const withoutGitSuffix = remoteUrl.replace(/[?#].*$/, '').replace(/\.git$/i, '');
+  // The userinfo group `[^@/]+@` stops at the first unencoded '@' or '/'. Git requires those to
+  // be percent-encoded in a URL, but if a caller's password contains one anyway, part of the
+  // password (everything after that character) ends up read as host/path instead of being
+  // dropped, e.g. "https://user:p@ss@host/org/repo" -> "ss@host/org/repo" rather than "org/repo".
+  const urlMatch = withoutGitSuffix.match(/^(\w+):\/\/(?:[^@/]+@)?([^/]+)\/(.+)$/);
+  // SSH scp-style remotes come in two shapes: "user@host:path" and, for an `ssh_config` Host
+  // alias with no explicit user (e.g. "github-work:org/repo.git"), bare "host:path". The alias
+  // form requires a 2+ character host (so a single-letter Windows drive like "C:\..." is still
+  // treated as a filesystem path) and forbids both "scheme://" and any '@' in the remainder, so
+  // it never swallows a credential-bearing or scheme-qualified remote.
+  const scpMatch =
+    withoutGitSuffix.match(/^[^/@]+@([^:]+):(.+)$/) ??
+    withoutGitSuffix.match(/^([^/@\\:]{2,}):(?!\/\/)([^@]+)$/);
+  const match = urlMatch ?? scpMatch;
+
+  // A scheme:// or user@host[:...] remote that did not match above (e.g. no repository path, or
+  // no colon before the host) is not a filesystem path. Falling through to the bare-filesystem
+  // handling below would split its userinfo/host into the result and leak credentials; bail out
+  // instead. A real filesystem path essentially never contains '@', so that alone is sufficient
+  // to catch every credential-bearing shape, including a bare "user:token@host" with no scheme
+  // and no trailing ":path". `file://` is exempt since it carries no credentials.
+  if (!match && (/^(?!file:)\w+:\/\//i.test(withoutGitSuffix) || withoutGitSuffix.includes('@'))) {
+    return undefined;
+  }
+
+  // Bare filesystem remote (e.g. "/home/user/repo.git", "../repo.git"): neither the
+  // scheme:// form nor the scp-style user@host: form applies, so there is no host and the
+  // whole (suffix-stripped) string is the path to split on.
+  const [scheme, host, path]: Array<string | undefined> = urlMatch
+    ? [urlMatch[1], urlMatch[2], urlMatch[3]]
+    : scpMatch
+      ? [undefined, scpMatch[1], scpMatch[2]]
+      : [undefined, undefined, withoutGitSuffix];
+  const hostname = host?.replace(/:\d+$/, '').toLowerCase();
+
+  // A matched URL/SCP remote uses POSIX-style '/' exclusively. An unmatched, bare-filesystem
+  // remote may be a Windows absolute or UNC path, so split on either separator there, or it
+  // would come out as one giant segment instead of being reduced to the last two.
+  const segments = (path as string)
+    .split(match ? '/' : /[/\\]/)
+    .filter(Boolean)
+    .map((segment) => {
+      try {
+        const decoded = decodeURIComponent(segment);
+        // A decoded control character (e.g. %0D%0A, %00), any character outside Latin-1
+        // (code > 0xFF — including the Unicode line/paragraph separators U+2028/U+2029), would
+        // break a downstream HTTP header (Node's http.request only accepts Latin-1 header
+        // values), a log line, or argv; keep the raw, still-encoded segment instead. Likewise, a
+        // decoded '/' (from an encoded %2F) would silently introduce an extra path level once
+        // segments are rejoined, letting two distinct remotes collide on the same derived name.
+        const hasUnsafeChar =
+          decoded.includes('/') ||
+          Array.from(decoded).some((char) => {
+            const code = char.codePointAt(0) ?? 0;
+            return code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code > 0xff;
+          });
+        return hasUnsafeChar ? segment : decoded;
+      } catch {
+        // Malformed %-escape: degrade to the raw segment rather than discarding the parse.
+        return segment;
+      }
+    });
+
+  const isAzureDevOps = hostname === 'dev.azure.com' || hostname === 'ssh.dev.azure.com';
+  const isLegacyVsSsh = hostname === 'vs-ssh.visualstudio.com';
+  const isLegacyVsHttps =
+    !!hostname && hostname.endsWith('.visualstudio.com') && !isLegacyVsSsh;
+
+  let result: string[];
+  if (isAzureDevOps || isLegacyVsSsh) {
+    result = segments.filter((segment, index) => segment !== '_git' && !(index === 0 && segment === 'v3'));
+  } else if (isLegacyVsHttps) {
+    // Organization lives in the hostname (org.visualstudio.com); casing is normalised by the final lower-casing.
+    const org = (host as string).replace(/:\d+$/, '').split('.')[0];
+    const rest = segments.filter(
+      (segment, index) =>
+        segment !== '_git' && !(index === 0 && segment.toLowerCase() === 'defaultcollection')
+    );
+    if (rest.length === 0) return undefined;
+    result = [org, ...rest];
+  } else {
+    // Bitbucket Server/DC HTTPS clone URLs prefix the repository path with "scm/", which may
+    // itself sit under a context path (e.g. "bitbucket/scm/PROJ/repo" for an install mounted at
+    // "/bitbucket"). Strip up to the first "scm" segment that still has at least a project and a
+    // repo segment after it, so both the context-path and root-mounted forms converge on
+    // "PROJ/repo" the way the matching SSH remote already does. A GitLab group literally named
+    // "scm" on an http(s) remote is a known, accepted false positive.
+    const isHttpScheme = scheme?.toLowerCase() === 'http' || scheme?.toLowerCase() === 'https';
+    const scmIndex = isHttpScheme
+      ? segments.findIndex((segment, index) => segment === 'scm' && segments.length - index - 1 >= 2)
+      : -1;
+    result = scmIndex === -1 ? segments : segments.slice(scmIndex + 1);
+  }
+
+  // Bitbucket personal repositories use "~user" as the project key.
+  if (result.length > 0 && result[0].length > 1 && result[0].startsWith('~')) {
+    result = [result[0].slice(1), ...result.slice(1)];
+  }
+
+  // A lone "~" with nothing else is not a useful repository name.
+  if (result.length === 1 && result[0] === '~') return undefined;
+
+  if (result.length === 0) return undefined;
+
+  // Best-effort fallback for the bare-filesystem shape: restore the prior behavior of
+  // using only the last two path segments (owner/repo), rather than the full path.
+  const joined = match ? result.join('/') : result.slice(-2).join('/');
+  return joined ? joined.toLowerCase() : undefined;
+}
+
+/**
+ * Detect the canonical repository identifier from a working directory's git `origin` remote.
  * Supports both HTTPS (https://github.com/owner/repo.git) and SSH (git@github.com:owner/repo.git) formats.
- * Works with GitHub, GitLab, Bitbucket, and self-hosted instances.
+ * Works with GitHub, GitLab, Bitbucket, Azure DevOps and self-hosted instances.
  *
  * @param cwd - Working directory path
- * @returns Repository in "owner/repo" format, or undefined if no remote is configured
+ * @returns Repository in lower-cased "owner/repo" format (or a longer path for subgroups/Azure
+ *   DevOps projects), or undefined if no remote is configured
  */
 export async function detectGitRemoteRepo(cwd: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execAsync('git remote get-url origin', { cwd, timeout: 5000 });
-    const remoteUrl = stdout.trim();
-    const match = remoteUrl.match(/[:/]([^/]+)\/([^/.]+?)(?:\.git)?$/);
-    if (match) return `${match[1]}/${match[2]}`;
-    return undefined;
+    const { stdout } = await execAsync('git remote get-url origin', { cwd, timeout: 5000, windowsHide: true });
+    return parseGitRemoteUrl(stdout.trim());
   } catch {
     return undefined;
   }
@@ -432,7 +570,8 @@ export async function detectGitBranch(cwd: string): Promise<string | undefined> 
   try {
     const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', {
       cwd,
-      timeout: 5000 // 5 second timeout
+      timeout: 5000,
+      windowsHide: true,
     });
 
     const branch = stdout.trim();

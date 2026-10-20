@@ -11,8 +11,9 @@ import { BaseModelProxy } from '../../core/base/BaseModelProxy.js';
 import { ProviderRegistry } from '../../core/registry.js';
 import { SSOTemplate } from './sso.template.js';
 import { CodeMieSSO } from './sso.auth.js';
-import { fetchCodeMieModels, fetchCodeMieIntegrations, CODEMIE_ENDPOINTS } from './sso.http-client.js';
+import { fetchCodeMieLlmModels, fetchCodeMieIntegrations, CODEMIE_ENDPOINTS } from './sso.http-client.js';
 import { logger } from '../../../utils/logger.js';
+import { getStoredPlatformCredentials } from '../../core/codemie-auth-helpers.js';
 
 /**
  * SSO Model Proxy
@@ -74,32 +75,40 @@ export class SSOModelProxy extends BaseModelProxy {
   /**
    * Fetch models for setup wizard
    *
-   * Returns models from CodeMie SSO API
+   * Returns models from CodeMie SSO API. When the setup wizard already holds
+   * cookies from the just-completed browser auth (see sso.setup-steps.ts
+   * getCredentials()), those are used directly instead of re-resolving
+   * credentials from disk/keychain, avoiding a race with the credential
+   * store write and reusing the same authenticated session.
    */
   async fetchModels(config: CodeMieConfigOptions): Promise<ModelInfo[]> {
-    try {
-      // Try to get credentials with URL parameter
-      const lookupUrl = config.codeMieUrl || config.baseUrl;
-      const credentials = await this.sso.getStoredCredentials(lookupUrl);
+    const suppliedCookies = (config as CodeMieConfigOptions & { cookies?: Record<string, string> }).cookies;
 
-      if (!credentials) {
-        // If no credentials yet, return empty array (setup wizard will handle auth)
-        logger.debug('No SSO credentials found, returning empty model list');
-        return [];
-      }
+    // Supplied cookies come with the auth result's API URL (config.baseUrl);
+    // codeMieUrl is the org/frontend URL and serves HTML, not the API.
+    if (suppliedCookies && config.baseUrl) {
+      // Real API/network errors propagate so setup.js can show an actionable
+      // message instead of silently reporting "Found 0 available models".
+      return await this.fetchModelsFromAPI(config.baseUrl, suppliedCookies);
+    }
 
-      // Use API URL from credentials or config
-      const apiUrl = credentials.apiUrl || config.codeMieUrl;
-      if (!apiUrl) {
-        throw new Error('No CodeMie URL configured');
-      }
+    // Profile baseUrl first, workspace codeMieUrl as fallback
+    const found = await getStoredPlatformCredentials({ ...config, provider: 'ai-run-sso' });
 
-      return await this.fetchModelsFromAPI(apiUrl, credentials.cookies);
-    } catch (error) {
-      logger.debug('Failed to fetch SSO models:', error);
-      // Return empty array instead of throwing - setup wizard will handle this
+    if (!found) {
+      // Genuinely no credentials yet - setup wizard will handle auth.
+      logger.debug('No SSO credentials found, returning empty model list');
       return [];
     }
+
+    // Use API URL from credentials or the URL the credentials were found under
+    const { credentials, url } = found;
+    const apiUrl = credentials.apiUrl || url;
+    if (!apiUrl) {
+      throw new Error('No CodeMie URL configured');
+    }
+
+    return await this.fetchModelsFromAPI(apiUrl, credentials.cookies);
   }
 
   /**
@@ -158,27 +167,33 @@ export class SSOModelProxy extends BaseModelProxy {
 
   /**
    * Fetch models from CodeMie API
+   *
+   * Uses fetchCodeMieLlmModels (the full descriptor, not the ID-only fetchCodeMieModels) so
+   * router entries surface their `is_router`/`litellm_router.is_router` flag as
+   * `metadata.isRouter` — the same signal claude.models.ts's `isRouterCatalogEntry` uses to gate
+   * the statusline's routing widget. Without this, `codemie models list` silently dropped every
+   * router alias a user could actually route through (Switchyard virtual routers and LiteLLM
+   * auto-router declarations alike), since fetchCodeMieModels never carried that flag through.
    */
   private async fetchModelsFromAPI(apiUrl: string, cookies: Record<string, string>): Promise<ModelInfo[]> {
     try {
-      // Use the working utility function that handles redirects, SSL, and retry logic
-      const modelIds = await fetchCodeMieModels(apiUrl, cookies);
+      const llmModels = await fetchCodeMieLlmModels(apiUrl, cookies);
 
-      if (modelIds.length === 0) {
-        return [];
-      }
-
-      // Transform model IDs to ModelInfo format
-      // Mark recommended models as popular for highlighting (⭐)
-      const models = modelIds.map(id => {
+      const models: ModelInfo[] = [];
+      for (const model of llmModels) {
+        const id = model.deployment_name || model.base_name || model.label;
+        if (!id) continue;
+        const isRouter = model.is_router === true || model.litellm_router?.is_router === true;
         const isRecommended = SSOTemplate.recommendedModels.includes(id);
 
-        return {
+        models.push({
           id,
-          name: id, // Use label from API
-          popular: isRecommended // Adds ⭐ to recommended models
-        };
-      });
+          name: model.label || id,
+          popular: isRecommended, // Adds ⭐ to recommended models
+          ...(isRouter && { metadata: { isRouter: true } }),
+        });
+      }
+      models.sort((a, b) => a.id.localeCompare(b.id));
 
       return models;
     } catch (error) {

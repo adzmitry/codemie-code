@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import type { LlmModel } from '../../../providers/plugins/sso/sso.http-client.js';
-import { fetchCodeMieLlmModels } from '../../../providers/plugins/sso/sso.http-client.js';
-import { CodeMieSSO } from '../../../providers/plugins/sso/sso.auth.js';
+import { fetchCodeMieLlmModels, buildModelLabelIndex, describeRouter, orderModelsForPicker } from '../../../providers/plugins/sso/sso.http-client.js';
+import { getPlatformUrlFromEnv, getStoredPlatformCredentialsFromEnv } from '../../../providers/core/codemie-auth-helpers.js';
 import { ConfigurationError } from '../../../utils/errors.js';
 import { logger } from '../../../utils/logger.js';
 import { resolveHomeDir } from '../../../utils/paths.js';
@@ -79,9 +79,42 @@ const INCOMPATIBLE_MODEL_PATTERNS: RegExp[] = [
 
 const COMPATIBLE_CODEX_MODEL_PATTERNS: RegExp[] = [
   /codex/i,
-  /^gpt[-.]?5(?:[-.]|\b)/i,
-  /^gpt[-.]?6(?:[-.]|\b)/i,
+  /gpt[-.]?5(?:[-.]|\b)/i,
+  /gpt[-.]?6(?:[-.]|\b)/i,
+  // Fallback for router/switchyard aliases that don't carry the catalog's `is_router` flag
+  // (e.g. a plain LiteLLM alias): `gpt-smart-router`, `gpt-fast-router`. Real Switchyard
+  // routers are matched via isRouterCatalogEntry below instead, since their names don't
+  // follow any fixed convention (e.g. `sy-signal-gpt-terra-luna`). Anchored to a `gpt-`
+  // prefix on purpose: a provider-agnostic router could pick a Claude model, which the
+  // Responses API wire format cannot drive. Claude-named routers stay rejected by
+  // INCOMPATIBLE_MODEL_PATTERNS above.
+  /^gpt[-._](?:[a-z0-9]+[-._])*router\b/i,
 ];
+
+// CODEMIE_MODEL_SOURCE values that mean the user picked this model (`--model`, or the
+// environment) rather than it coming from a saved profile. Set by AgentCLI.
+const EXPLICIT_MODEL_SOURCES = new Set(['cli', 'env']);
+
+function isExplicitModelChoice(env: NodeJS.ProcessEnv): boolean {
+  return EXPLICIT_MODEL_SOURCES.has(env.CODEMIE_MODEL_SOURCE ?? '');
+}
+
+/**
+ * Build a catalog entry for a model the CodeMie catalog does not enumerate.
+ *
+ * Router aliases are commonly served by the gateway without being listed as deployments, so
+ * an explicitly requested one has to be injected: `availableModels` gates our own assertion
+ * and the generated models.json gates Codex's `--model` validation, and a model missing from
+ * either is rejected before a single request is made.
+ */
+function syntheticRankedModel(id: string): RankedModel {
+  return {
+    id,
+    model: { base_name: id, deployment_name: id, label: id, enabled: true },
+    // Ranks ahead of every catalog entry so it becomes the default selection.
+    score: [Number.MAX_SAFE_INTEGER],
+  };
+}
 
 const REASONING_LEVELS: CodexCatalogReasoningLevel[] = [
   { effort: 'low', description: 'Fast responses with lighter reasoning' },
@@ -109,16 +142,46 @@ export function isCodexCompatibleModelName(modelName: string | undefined): model
   return COMPATIBLE_CODEX_MODEL_PATTERNS.some(pattern => pattern.test(modelName));
 }
 
+/**
+ * Present (`is_router`) on a Switchyard virtual router entry, or nested (`litellm_router.is_router`)
+ * on a declared LiteLLM auto-router — see LlmModel's own field docs. Mirrors
+ * claude.models.ts's isRouterCatalogEntry: router alias names follow no fixed convention
+ * (e.g. `sy-signal-gpt-terra-luna`), so membership must be read from this catalog flag
+ * rather than guessed from the id.
+ */
+function isRouterCatalogEntry(model: LlmModel): boolean {
+  return model.is_router === true || model.litellm_router?.is_router === true;
+}
+
 function isCodexCompatibleModel(model: LlmModel): boolean {
   if (!model.enabled) return false;
 
   const id = getModelId(model);
   if (!id) return false;
 
+  // A LiteLLM auto-router's own alias name is family-agnostic by convention
+  // (`claude-smart-router` and `gpt-smart-router` are both named like routers, not like
+  // their target), so name-sniffing it is unreliable — a differently-named Claude router
+  // could slip past INCOMPATIBLE_MODEL_PATTERNS below. `counterfactual_model` names the
+  // concrete deployment the router currently resolves to, which is a deterministic signal:
+  // judge the router by what it actually dispatches to instead of by its own name.
+  const counterfactual = model.litellm_router?.counterfactual_model;
+  if (counterfactual) {
+    return isCodexCompatibleModelName(counterfactual);
+  }
+
   const searchText = getSearchText(model);
   if (INCOMPATIBLE_MODEL_PATTERNS.some(pattern => pattern.test(searchText))) {
     return false;
   }
+
+  // A Switchyard virtual router (top-level `is_router`) carries no target-model field to
+  // check deterministically — CodeMie's own naming convention embeds the constituent model
+  // families directly in base_name/label instead (e.g. `sy-signal-gpt-terra-luna` / "SY
+  // Signal Terra/Luna" vs. `sy-signal-claude-sonnet-haiku` / "SY Signal Sonnet/Haiku"), so
+  // the incompatible-name check above — already run — is the most precise signal available
+  // for this shape, and is trusted here.
+  if (isRouterCatalogEntry(model)) return true;
 
   return COMPATIBLE_CODEX_MODEL_PATTERNS.some(pattern => pattern.test(searchText));
 }
@@ -251,12 +314,28 @@ function compareRankedModels(a: RankedModel, b: RankedModel): number {
   return a.id.localeCompare(b.id);
 }
 
-function buildCodexCatalog(models: RankedModel[]): CodexModelCatalog {
+/**
+ * Codex's own model picker (as of codex-cli 0.154.0) ignores a catalog entry's
+ * `display_name` entirely — see https://github.com/openai/codex/issues/46183 — and renders
+ * only `slug` and `description`. Until that upstream fix (already merged, not yet in the
+ * version codemie-code targets) reaches the pinned Codex version, `description` is the only
+ * field that actually reaches the picker, so a router's per-tier routing — the one thing the
+ * slug itself doesn't reveal — is folded into it as a workaround via `describeRouter`.
+ * Everything else (a plain model, or a router the backend hasn't populated a tier map for)
+ * has nothing more specific to add beyond its already-shown slug, so its description is left
+ * empty rather than filled with a guess. `display_name` is left set correctly regardless, so
+ * nothing needs to change here once Codex picks it up.
+ *
+ * `labelIndex` is built from the FULL raw catalog, not just the Codex-compatible subset — a
+ * router's classifier model can belong to a different family (a Claude classifier gating a
+ * GPT router) and still needs its label resolved.
+ */
+function buildCodexCatalog(models: RankedModel[], labelIndex: Map<string, string>): CodexModelCatalog {
   return {
     models: models.map((entry, index) => ({
       slug: entry.id,
       display_name: entry.model.label || entry.id,
-      description: 'CodeMie model available for Codex through the Responses API.',
+      description: describeRouter(entry.model, labelIndex),
       default_reasoning_level: 'medium',
       supported_reasoning_levels: REASONING_LEVELS,
       shell_type: 'shell_command',
@@ -280,8 +359,8 @@ function buildCodexCatalog(models: RankedModel[]): CodexModelCatalog {
       },
       supports_parallel_tool_calls: true,
       supports_image_detail_original: true,
-      context_window: 400000,
-      max_context_window: 400000,
+      context_window: /gpt[-.]?6(?:[-.]|\b)|gpt[-.]?5[.-]6(?:[-.]|\b)/i.test(entry.id) ? 1050000 : 400000,
+      max_context_window: /gpt[-.]?6(?:[-.]|\b)|gpt[-.]?5[.-]6(?:[-.]|\b)/i.test(entry.id) ? 1050000 : 400000,
       effective_context_window_percent: 95,
       experimental_supported_tools: [],
       input_modalities: entry.model.multimodal ? ['text', 'image'] : ['text'],
@@ -299,18 +378,17 @@ async function fetchCodeMieModelsForCodex(env: NodeJS.ProcessEnv): Promise<LlmMo
     return fetchCodeMieLlmModels(baseUrl, jwtToken);
   }
 
-  const codeMieUrl = env.CODEMIE_URL;
-  if (codeMieUrl) {
-    const sso = new CodeMieSSO();
-    const credentials = await sso.getStoredCredentials(codeMieUrl);
-    if (!credentials) {
+  const platformUrl = getPlatformUrlFromEnv(env);
+  if (platformUrl) {
+    const found = await getStoredPlatformCredentialsFromEnv(env);
+    if (!found) {
       throw new ConfigurationError(
-        `SSO credentials not found for ${codeMieUrl}. Run: codemie profile login --url ${codeMieUrl}`
+        `SSO credentials not found for ${platformUrl}. Run: codemie profile login --url ${platformUrl}`
       );
     }
 
     logger.debug('[codex-models] Fetching CodeMie model list via SSO auth');
-    return fetchCodeMieLlmModels(credentials.apiUrl, credentials.cookies);
+    return fetchCodeMieLlmModels(found.credentials.apiUrl, found.credentials.cookies);
   }
 
   return [];
@@ -365,12 +443,43 @@ export async function resolveCodexModel(env: NodeJS.ProcessEnv): Promise<CodexMo
     );
   }
 
-  const rankedIds = rankedModels.map(entry => entry.id);
+  let catalogModels = rankedModels;
+  let rankedIds = rankedModels.map(entry => entry.id);
+
+  // A compatible model the user asked for by name is honoured even when the catalog does not
+  // list it. Router aliases are the motivating case: the gateway resolves them per request
+  // and does not necessarily publish them as deployments, so requiring catalog membership
+  // would make them permanently unusable. Restricted to an explicit choice — a stale profile
+  // value still gets re-resolved against the live catalog as before.
+  if (
+    isCodexCompatibleModelName(currentModel) &&
+    !rankedIds.includes(currentModel) &&
+    isExplicitModelChoice(env)
+  ) {
+    catalogModels = [syntheticRankedModel(currentModel), ...rankedModels];
+    rankedIds = catalogModels.map(entry => entry.id);
+    console.error(
+      `[codemie-codex] Model "${currentModel}" is not listed in the CodeMie catalog; using it anyway because it was requested explicitly.`
+    );
+    logger.info(`[codex-models] Honouring explicitly requested uncatalogued model ${currentModel}`);
+  }
+
+  // Catalog membership (rankedIds) is authoritative here — it already reflects
+  // isCodexCompatibleModel, which trusts a flagged router regardless of its name (see
+  // isRouterCatalogEntry). Re-checking isCodexCompatibleModelName on top would reject a
+  // router whose name doesn't match the name-based fallback pattern even though the
+  // catalog just vouched for it.
   const selectedModel =
-    isCodexCompatibleModelName(currentModel) && rankedIds.includes(currentModel)
+    currentModel && rankedIds.includes(currentModel)
       ? currentModel
-      : rankedModels[0].id;
-  const catalogPath = await writeCatalogFile(buildCodexCatalog(rankedModels));
+      : catalogModels[0].id;
+  const catalogPath = await writeCatalogFile(
+    // Codex marks the first row as its default, so the selected model leads (keeping the marker
+    // on the model actually in use), then routers, then the rest; `priority` is the position.
+    buildCodexCatalog(
+      orderModelsForPicker(catalogModels, (entry) => entry.model, (entry) => entry.id === selectedModel),
+      buildModelLabelIndex(rawModels))
+  );
 
   if (isCodexCompatibleModelName(currentModel) && currentModel !== selectedModel) {
     console.error(`[codemie-codex] Requested model "${currentModel}" is not available; using ${selectedModel} instead.`);
@@ -382,11 +491,20 @@ export async function resolveCodexModel(env: NodeJS.ProcessEnv): Promise<CodexMo
   return {
     selectedModel,
     catalogPath,
-    availableModels: rankedModels.map(entry => entry.id),
+    availableModels: rankedIds,
   };
 }
 
 export function assertExplicitCodexModelAllowed(model: string, availableModels: string[]): void {
+  // A model the live catalog already vouches for (resolveCodexModel's availableModels,
+  // which trusts a flagged router regardless of its name — see isRouterCatalogEntry) needs
+  // no further name-pattern validation. Without this, a router like
+  // `sy-signal-gpt-terra-luna` — correctly listed as available — would still be rejected
+  // here by the name-based fallback pattern, which only recognizes `gpt-*-router` aliases.
+  if (availableModels.length > 0 && availableModels.includes(model)) {
+    return;
+  }
+
   if (!isCodexCompatibleModelName(model)) {
     throw new ConfigurationError(
       `Model "${model}" is not compatible with codemie-codex. ` +

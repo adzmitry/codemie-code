@@ -44,7 +44,6 @@
 import type { AgentMetadata, AgentConfig } from '../../core/types.js';
 import { BaseAgentAdapter } from '../../core/BaseAgentAdapter.js';
 import type { SessionAdapter } from '../../core/session/BaseSessionAdapter.js';
-import type { SessionDescriptor } from '../../core/session/discovery-types.js';
 import type { BaseExtensionInstaller } from '../../core/extension/BaseExtensionInstaller.js';
 import type { HookProcessingConfig } from '../../../cli/commands/hook.js';
 import { commandExists, exec } from '../../../utils/processes.js';
@@ -62,7 +61,8 @@ import {
   stopCodexIncrementalSync,
 } from './codex.incremental-sync.js';
 import { reconcileStaleCodexSessions } from './codex.reconciliation.js';
-import { mkdir, realpath as fsRealpath } from 'fs/promises';
+import { findRolloutForRun, recordRolloutCorrelation } from './codex.correlation.js';
+import { mkdir } from 'fs/promises';
 
 /**
  * Supported Codex CLI version
@@ -86,6 +86,13 @@ const CODEX_MINIMUM_SUPPORTED_VERSION = '0.143.0';
 /**
  * Build a hook config object from environment variables.
  * Used by both onSessionStart and onSessionEnd lifecycle hooks.
+ *
+ * clientType reads env.CODEMIE_CLIENT_TYPE (set by BaseAgentAdapter from
+ * metadata.ssoConfig.clientType for every agent) rather than a fixed string,
+ * so that plugins extending CodexPlugin with a different clientType (e.g.
+ * codex-acp's 'codemie-codex-acp') are tagged correctly in telemetry. Falls
+ * back to 'codemie-codex' to preserve behavior for plain Codex / any caller
+ * that doesn't set the env var.
  */
 function buildHookConfig(env: NodeJS.ProcessEnv, sessionId: string): HookProcessingConfig {
   return {
@@ -94,12 +101,13 @@ function buildHookConfig(env: NodeJS.ProcessEnv, sessionId: string): HookProcess
     provider: env.CODEMIE_PROVIDER,
     apiBaseUrl: env.CODEMIE_BASE_URL,
     ssoUrl: env.CODEMIE_URL,
+    env,
     syncApiUrl: env.CODEMIE_SYNC_API_URL,
     version: env.CODEMIE_CLI_VERSION,
     profileName: env.CODEMIE_PROFILE_NAME,
     project: env.CODEMIE_PROJECT,
     model: env.CODEMIE_MODEL,
-    clientType: 'codemie-codex',
+    clientType: env.CODEMIE_CLIENT_TYPE || 'codemie-codex',
   };
 }
 
@@ -220,13 +228,14 @@ export const CodexPluginMetadata: AgentMetadata = {
           cwd: process.cwd(),
           metadata: CodexPluginMetadata,
           ssoUrl: env.CODEMIE_URL,
+          env,
           syncApiUrl: env.CODEMIE_SYNC_API_URL || env.CODEMIE_BASE_URL,
           cliVersion: env.CODEMIE_CLI_VERSION,
           buildContext: () => ({
             sessionId,
             apiBaseUrl: env.CODEMIE_BASE_URL || '',
             cookies: '',
-            clientType: 'codemie-codex',
+            clientType: env.CODEMIE_CLIENT_TYPE || 'codemie-codex',
             version: env.CODEMIE_CLI_VERSION || '0.0.0',
             dryRun: false,
           }),
@@ -315,10 +324,11 @@ export const CodexPluginMetadata: AgentMetadata = {
 
       // 4. Inject session tuning flags (unconditional).
       // --config uses TOML values: integers unquoted, strings double-quoted.
+      const maxOutputTokens = /gpt[-.]?6(?:[-.]|\b)|gpt[-.]?5[.-]6(?:[-.]|\b)/i.test(config?.model ?? '') ? 128000 : 16384;
       enriched = [
         '--config', 'stream_max_retries=40',
         '--config', 'request_max_retries=40',
-        '--config', 'max_output_tokens=16384',
+        '--config', `max_output_tokens=${maxOutputTokens}`,
         '--config', 'model_verbosity="medium"',
         ...enriched,
       ];
@@ -356,49 +366,29 @@ export const CodexPluginMetadata: AgentMetadata = {
         logger.info(`[codex] Processing session metrics (code=${exitCode})`);
 
         const adapter = new CodexSessionAdapter(CodexPluginMetadata);
-        const sessions = await adapter.discoverSessions({ maxAgeDays: 1, limit: 20 });
-
         const startedAt = env.CODEMIE_CODEX_STARTED_AT
           ? Number(env.CODEMIE_CODEX_STARTED_AT)
           : Date.now() - 5 * 60 * 1000;
-        const currentCwd = process.cwd();
-        const cwdReal = await safeRealpath(currentCwd);
-        const recentSessions: SessionDescriptor[] = [];
+        const rollout = await findRolloutForRun(adapter, { sessionId, startedAt, cwd: process.cwd() });
 
-        for (const session of sessions) {
-          if (session.createdAt < startedAt - 10_000) {
-            continue;
-          }
-
-          try {
-            const parsed = await adapter.parseSessionFile(session.filePath, sessionId);
-            const projectPath = parsed.metadata?.projectPath;
-            if (!projectPath) continue;
-            const projectReal = await safeRealpath(projectPath);
-            if (projectReal === cwdReal) {
-              recentSessions.push(session);
-            }
-          } catch (error) {
-            logger.debug('[codex] Skipping unparsable rollout candidate:', error);
-          }
-        }
-
-        if (recentSessions.length === 0) {
+        if (!rollout) {
           logger.warn('[codex] No rollout file matched the current run, skipping metrics');
         } else {
-          const latestSession = recentSessions[0];
-          logger.debug(`[codex] Processing latest rollout: ${latestSession.sessionId}`);
+          logger.debug(`[codex] Processing rollout: ${rollout.sessionId}`);
+
+          // Must land before SessionEnd renames the record to completed_{id}.json.
+          await recordRolloutCorrelation(sessionId, rollout.filePath);
 
           const context = {
             sessionId,
             apiBaseUrl: env.CODEMIE_BASE_URL || '',
             cookies: '',
-            clientType: 'codemie-codex',
+            clientType: env.CODEMIE_CLIENT_TYPE || 'codemie-codex',
             version: env.CODEMIE_CLI_VERSION || '1.0.0',
             dryRun: false,
           };
 
-          const result = await adapter.processSession(latestSession.filePath, sessionId, context);
+          const result = await adapter.processSession(rollout.filePath, sessionId, context);
 
           if (result.success) {
             logger.info(`[codex] Metrics written to JSONL: ${result.totalRecords} records`);
@@ -444,19 +434,6 @@ function getExplicitModelArg(args: string[]): string | undefined {
   }
 
   return undefined;
-}
-
-/**
- * Resolve a path through symlinks, falling back to the original path on error.
- * Used so a `cwd` of `/Users/foo` and a rollout's `projectPath` of
- * `/private/Users/foo` (or vice versa) compare equal.
- */
-async function safeRealpath(p: string): Promise<string> {
-  try {
-    return await fsRealpath(p);
-  } catch {
-    return p;
-  }
 }
 
 /**

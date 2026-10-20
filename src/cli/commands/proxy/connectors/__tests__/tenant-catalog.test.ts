@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fetchTenantModelCatalog } from '../tenant-catalog.js';
+import { fetchTenantModelCatalog, fetchTenantModelDescriptors } from '../tenant-catalog.js';
 import { ConfigurationError } from '@/utils/errors.js';
 
 describe('fetchTenantModelCatalog', () => {
@@ -110,5 +110,95 @@ describe('fetchTenantModelCatalog', () => {
   it('wraps a malformed proxyUrl in ConfigurationError instead of a raw TypeError', async () => {
     await expect(fetchTenantModelCatalog('not-a-valid-url', 'gw-key'))
       .rejects.toThrow(ConfigurationError);
+  });
+});
+
+describe('fetchTenantModelDescriptors', () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  const mkHeaders = (ct: string) => ({ get: (h: string) => h === 'content-type' ? ct : null });
+  const mockJson = (body: unknown): void => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: mkHeaders('application/json'),
+      json: async () => body,
+    }) as unknown as typeof globalThis.fetch;
+  };
+
+  it('maps label, provider, multimodal and features.tools per entry', async () => {
+    mockJson([
+      { base_name: 'gpt-6-sol', label: 'GPT-6 Sol', provider: 'azure_openai', multimodal: true, features: { tools: true } },
+      { id: 'text-only', multimodal: false, features: { tools: false } },
+      { deployment_name: 'bare' },
+    ]);
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors).toEqual([
+      { id: 'gpt-6-sol', label: 'GPT-6 Sol', provider: 'azure_openai', multimodal: true, toolCalling: true },
+      { id: 'text-only', multimodal: false, toolCalling: false },
+      { id: 'bare' },
+    ]);
+  });
+
+  it('maps valid max_input_tokens and max_output_tokens to token limits', async () => {
+    mockJson([{ base_name: 'm', max_input_tokens: 200000, max_output_tokens: 16000 }]);
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors).toEqual([{ id: 'm', maxInputTokens: 200000, maxOutputTokens: 16000 }]);
+  });
+
+  it('omits zero, negative, string, null and missing token limits', async () => {
+    mockJson([
+      { base_name: 'zero', max_input_tokens: 0, max_output_tokens: 0 },
+      { base_name: 'negative', max_input_tokens: -5, max_output_tokens: -1 },
+      { base_name: 'string', max_input_tokens: '200000', max_output_tokens: '16000' },
+      { base_name: 'null', max_input_tokens: null, max_output_tokens: null },
+      { base_name: 'missing' },
+    ]);
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors).toEqual([
+      { id: 'zero' }, { id: 'negative' }, { id: 'string' }, { id: 'null' }, { id: 'missing' },
+    ]);
+  });
+
+  it('drops enabled: false entries and treats a missing enabled as enabled', async () => {
+    mockJson({ data: [
+      { base_name: 'on', enabled: true },
+      { base_name: 'off', enabled: false },
+      { base_name: 'implicit' },
+    ] });
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors.map((d) => d.id)).toEqual(['on', 'implicit']);
+  });
+
+  it('trims extracted ids and skips blank ones (CR-001)', async () => {
+    mockJson([
+      { id: '', base_name: '', deployment_name: '' },
+      { id: '   ', label: 'Whitespace' },
+      { base_name: '  padded-model  ' },
+      { base_name: 'padded-model' },
+      { deployment_name: 'real' },
+    ]);
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors.map((d) => d.id)).toEqual(['padded-model', 'real']);
+  });
+
+  it('keeps the first of two same-id entries, in response order', async () => {
+    mockJson([
+      { base_name: 'b-model', label: 'First B' },
+      { base_name: 'a-model' },
+      { base_name: 'b-model', label: 'Second B' },
+    ]);
+
+    const descriptors = await fetchTenantModelDescriptors('http://127.0.0.1:4001', 'gw-key');
+    expect(descriptors).toEqual([
+      { id: 'b-model', label: 'First B' },
+      { id: 'a-model' },
+    ]);
   });
 });

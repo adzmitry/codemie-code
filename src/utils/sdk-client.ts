@@ -8,10 +8,11 @@ import ora from 'ora';
 import chalk from 'chalk';
 import { CodeMieClient } from 'codemie-sdk';
 import type { CodeMieConfigOptions } from '../env/types.js';
-import { CodeMieSSO } from '../providers/plugins/sso/sso.auth.js';
+import { getPlatformUrl, getStoredPlatformCredentials } from '../providers/core/codemie-auth-helpers.js';
 import { ConfigLoader } from './config.js';
 import { ConfigurationError } from './errors.js';
 import { logger } from './logger.js';
+import { applySystemProxyEnvironment } from './system-proxy.js';
 
 /**
  * Get authenticated CodeMieClient instance
@@ -43,10 +44,9 @@ export async function getCodemieClient(quiet = false): Promise<CodeMieClient> {
   if (spinner) {
     spinner.text = 'Retrieving authentication credentials...';
   }
-  const ssoAuth = new CodeMieSSO();
 
-  // Use codeMieUrl for credential lookup, not baseUrl (which may be proxied)
-  const credentialLookupUrl = config.codeMieUrl || config.baseUrl;
+  // Profile baseUrl is tried first, workspace codeMieUrl is the fallback
+  const credentialLookupUrl = getPlatformUrl(config);
 
   logger.debug('Attempting to retrieve SSO credentials', {
     baseUrl: config.baseUrl,
@@ -54,7 +54,7 @@ export async function getCodemieClient(quiet = false): Promise<CodeMieClient> {
     hasBaseUrl: !!config.baseUrl
   });
 
-  const credentials = await ssoAuth.getStoredCredentials(credentialLookupUrl);
+  const credentials = (await getStoredPlatformCredentials(config))?.credentials;
 
   logger.debug('SSO credentials retrieval result', {
     hasCredentials: !!credentials,
@@ -85,6 +85,10 @@ export async function getCodemieClient(quiet = false): Promise<CodeMieClient> {
     spinner.text = 'Initializing SDK...';
   }
 
+  // The SDK talks over axios, which resolves proxies from the environment per
+  // request; on Windows the corporate proxy lives in Internet Settings only.
+  await applySystemProxyEnvironment(credentials.apiUrl);
+
   try {
     const client = new CodeMieClient({
       codemie_api_domain: credentials.apiUrl,
@@ -108,4 +112,3 @@ export async function getCodemieClient(quiet = false): Promise<CodeMieClient> {
     );
   }
 }
-

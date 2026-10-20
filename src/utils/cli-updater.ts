@@ -8,6 +8,8 @@
  * - CODEMIE_AUTO_UPDATE=true (default): Silently update without prompting
  * - CODEMIE_AUTO_UPDATE=false: Prompt user before updating
  * - CODEMIE_UPDATE_CHECK_INTERVAL: Time between update checks in ms (default: 86400000 = 24h)
+ *
+ * CodeMie Connect installs (codemie-connect.json marker next to package.json) never self-update.
  */
 
 import fs from 'fs/promises';
@@ -17,11 +19,12 @@ import inquirer from 'inquirer';
 import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
 import { getLatestVersion, installGlobal } from './processes.js';
+import { getNpmPrefixArgs } from './npm-prefix.js';
 import { compareVersions, isValidSemanticVersion } from './version-utils.js';
 import { getCodemiePath } from './paths.js';
 import { parseBooleanEnv } from './env.js';
 
-const CLI_PACKAGE_NAME = '@codemieai/code';
+export const CLI_PACKAGE_NAME = '@codemieai/code';
 
 // Rate limiting: Check for updates at most once per interval (default: 24 hours)
 const UPDATE_CHECK_INTERVAL = parseInt(
@@ -30,6 +33,10 @@ const UPDATE_CHECK_INTERVAL = parseInt(
 );
 const LAST_CHECK_FILE = path.join(getCodemiePath(), '.last-update-check');
 const UPDATE_LOCK_FILE = path.join(getCodemiePath(), '.update-lock');
+
+// A lock older than this is considered orphaned (holder crashed or was killed
+// mid-update) and is reclaimed. Generous vs. the 60s update install timeout.
+const UPDATE_LOCK_STALE_MS = 10 * 60 * 1000;
 
 /**
  * Get the current CLI version from package.json
@@ -47,6 +54,21 @@ export async function getCurrentCliVersion(): Promise<string | null> {
   } catch (error) {
     logger.debug('Failed to read current CLI version:', error);
     return null;
+  }
+}
+
+/**
+ * Detect a CLI bundled in CodeMie Connect: a codemie-connect.json marker sits
+ * next to the package's package.json. Such installs are updated by the Connect app.
+ */
+export async function isCodemieConnectInstall(): Promise<boolean> {
+  try {
+    const dirname = path.dirname(fileURLToPath(import.meta.url));
+    await fs.access(path.resolve(dirname, '../../codemie-connect.json'));
+    return true;
+  } catch (error) {
+    logger.debug('CodeMie Connect marker not found:', error);
+    return false;
   }
 }
 
@@ -85,20 +107,44 @@ async function recordUpdateCheck(): Promise<void> {
 
 /**
  * Acquire lock file to prevent concurrent updates
+ * Reclaims the lock when it is stale (holder died before releasing it)
  * @returns true if lock acquired, false if another process is updating
  */
 async function acquireUpdateLock(): Promise<boolean> {
-  try {
-    // Try to create lock file with exclusive flag (fails if exists)
-    const fd = await fs.open(UPDATE_LOCK_FILE, 'wx');
-    await fd.close();
+  const tryAcquire = async (): Promise<boolean> => {
+    try {
+      // Try to create lock file with exclusive flag (fails if exists)
+      const fd = await fs.open(UPDATE_LOCK_FILE, 'wx');
+      await fd.close();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await tryAcquire()) {
     logger.debug('Acquired update lock');
     return true;
-  } catch {
-    // Lock file exists - another process is updating
-    logger.debug('Update lock already held by another process');
-    return false;
   }
+
+  // Lock file exists - either another process is updating, or a previous
+  // process died before releasing it. Reclaim only when provably stale.
+  try {
+    const { mtimeMs } = await fs.stat(UPDATE_LOCK_FILE);
+    const ageMs = Date.now() - mtimeMs;
+    if (ageMs < UPDATE_LOCK_STALE_MS) {
+      logger.debug('Update lock already held by another process');
+      return false;
+    }
+    logger.debug(`Removing stale update lock (${Math.floor(ageMs / 60000)} min old)`);
+    await fs.unlink(UPDATE_LOCK_FILE);
+  } catch {
+    // Lock vanished between attempts (holder released it) - retry below
+  }
+
+  const acquired = await tryAcquire();
+  logger.debug(acquired ? 'Acquired update lock after clearing stale lock' : 'Update lock already held by another process');
+  return acquired;
 }
 
 /**
@@ -271,8 +317,10 @@ export async function updateCli(latestVersion: string, silent = false): Promise<
     console.log();
     console.error(chalk.red('✗ Failed to update CodeMie CLI'));
     console.log();
+    const [, prefix] = await getNpmPrefixArgs();
+    const prefixFlag = prefix ? ` --prefix "${prefix}"` : '';
     console.log(chalk.yellow('  You can manually update with:'));
-    console.log(chalk.white(`    npm install -g ${CLI_PACKAGE_NAME}@${latestVersion}`));
+    console.log(chalk.white(`    npm install -g ${CLI_PACKAGE_NAME}@${latestVersion}${prefixFlag}`));
     console.log();
     console.log(chalk.dim('  💡 To disable auto-update: export CODEMIE_AUTO_UPDATE=false'));
     console.log();
@@ -295,6 +343,11 @@ export async function updateCli(latestVersion: string, silent = false): Promise<
  * Non-blocking: Failures are logged but don't block CLI startup
  */
 export async function checkAndPromptForUpdate(): Promise<void> {
+  // CodeMie Connect installs are updated by the Connect app, never by the CLI
+  if (await isCodemieConnectInstall()) {
+    return;
+  }
+
   try {
     // PERFORMANCE FIX: Rate limiting - only check once per interval (default: 24h)
     if (!(await shouldCheckForUpdate())) {

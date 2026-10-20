@@ -281,7 +281,7 @@ describe('proxy connect desktop', () => {
 
     await createProxyCommand().parseAsync(['connect', 'desktop'], { from: 'user' });
 
-    expect(ConfigLoader.load).toHaveBeenCalledWith(process.cwd());
+    expect(ConfigLoader.load).toHaveBeenCalledWith(process.cwd(), undefined);
     expect(spawnDaemon).toHaveBeenCalledWith(expect.objectContaining({
       profile: 'selected-profile',
     }));
@@ -452,8 +452,7 @@ describe('proxy connect vscode', () => {
     expect(writeVsCodeLanguageModelsConfig).toHaveBeenCalledWith(
       'http://127.0.0.1:4001',
       'local-key',
-      false,
-      undefined
+      false
     );
   });
 
@@ -496,8 +495,7 @@ describe('proxy connect vscode', () => {
     expect(writeVsCodeLanguageModelsConfig).toHaveBeenCalledWith(
       'http://127.0.0.1:4001',
       'local-key',
-      false,
-      'shared-profile-model'
+      false
     );
   });
 

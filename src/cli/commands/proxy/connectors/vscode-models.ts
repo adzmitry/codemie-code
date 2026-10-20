@@ -1,3 +1,6 @@
+import { resolveTenantModelId } from './model-name-resolver.js';
+import type { TenantModelDescriptor } from './tenant-catalog.js';
+
 export type VsCodeApiType = 'chat-completions' | 'responses' | 'messages';
 
 export type VsCodeReasoningEffort =
@@ -14,6 +17,8 @@ export interface VsCodeCapabilityEntry {
   apiType: VsCodeApiType;
   vision: boolean;
   thinking: boolean;
+  /** Absent means the model supports tool calling. */
+  toolCalling?: boolean;
   zeroDataRetentionEnabled?: boolean;
   adaptiveThinking?: true;
   modelOptions?: Readonly<{
@@ -31,6 +36,7 @@ const GPT_5_EFFORTS = ['minimal', 'low', 'medium', 'high'] as const;
 const GPT_5_2_EFFORTS = ['none', 'low', 'medium', 'high'] as const;
 const GPT_5_XHIGH_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh'] as const;
 const GPT_5_6_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+const GPT_6_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const GEMINI_FLASH_EFFORTS = ['minimal', 'low', 'medium', 'high'] as const;
 const GEMINI_PRO_EFFORTS = ['low', 'medium', 'high'] as const;
 const CLAUDE_EFFORTS = ['low', 'medium', 'high'] as const;
@@ -40,6 +46,12 @@ const MESSAGE_AUTH_HEADERS = {
   Authorization: 'Bearer ${apiKey}',
 } as const;
 
+/**
+ * Token limits here are fallbacks: they apply only when the tenant catalog
+ * does not report a limit for the model (see {@link resolveVsCodeTokenLimits}).
+ * The table's `maxInputTokens` is a prompt budget (window minus output), while
+ * the catalog value is not, hence the catalog input has the output subtracted.
+ */
 export const VS_CODE_CAPABILITY_TABLE: readonly VsCodeCapabilityEntry[] = [
   {
     family: 'claude-sonnet-4-5',
@@ -160,6 +172,50 @@ export const VS_CODE_CAPABILITY_TABLE: readonly VsCodeCapabilityEntry[] = [
     thinking: true,
     zeroDataRetentionEnabled: true,
     supportsReasoningEffort: GPT_5_6_EFFORTS,
+    reasoningEffortFormat: 'responses',
+    maxInputTokens: 922000,
+    maxOutputTokens: 128000,
+  },
+  {
+    family: 'gpt-6-luna',
+    apiType: 'responses',
+    vision: true,
+    thinking: true,
+    zeroDataRetentionEnabled: true,
+    supportsReasoningEffort: GPT_6_EFFORTS,
+    reasoningEffortFormat: 'responses',
+    maxInputTokens: 922000,
+    maxOutputTokens: 128000,
+  },
+  {
+    family: 'gpt-6-sol',
+    apiType: 'responses',
+    vision: true,
+    thinking: true,
+    zeroDataRetentionEnabled: true,
+    supportsReasoningEffort: GPT_6_EFFORTS,
+    reasoningEffortFormat: 'responses',
+    maxInputTokens: 922000,
+    maxOutputTokens: 128000,
+  },
+  {
+    family: 'gpt-6-astra',
+    apiType: 'responses',
+    vision: true,
+    thinking: true,
+    zeroDataRetentionEnabled: true,
+    supportsReasoningEffort: GPT_6_EFFORTS,
+    reasoningEffortFormat: 'responses',
+    maxInputTokens: 922000,
+    maxOutputTokens: 128000,
+  },
+  {
+    family: 'gpt-6.1-sol',
+    apiType: 'responses',
+    vision: true,
+    thinking: true,
+    zeroDataRetentionEnabled: true,
+    supportsReasoningEffort: GPT_6_EFFORTS,
     reasoningEffortFormat: 'responses',
     maxInputTokens: 922000,
     maxOutputTokens: 128000,
@@ -313,3 +369,89 @@ export const VS_CODE_CAPABILITY_TABLE: readonly VsCodeCapabilityEntry[] = [
     maxOutputTokens: 16384,
   },
 ];
+
+/**
+ * The capability-table entry that describes `tenantId`, or `undefined` when no
+ * family matches. An exact family match wins; otherwise the first entry whose
+ * family the shared resolver maps onto `tenantId` (dated / vendor-prefixed /
+ * reordered tenant naming).
+ */
+export function findVsCodeCapabilityEntry(tenantId: string): VsCodeCapabilityEntry | undefined {
+  return VS_CODE_CAPABILITY_TABLE.find((entry) => entry.family === tenantId)
+    ?? VS_CODE_CAPABILITY_TABLE.find((entry) => resolveTenantModelId(entry.family, [tenantId]) === tenantId);
+}
+
+const DEFAULT_MAX_INPUT_TOKENS = 128000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+const MIN_RESPONSES_GPT_5_MINOR = 5;
+/** Leading vendor prefix such as `openai.`, `azure.` or `azure_openai/`. */
+const VENDOR_PREFIX = /^[a-z_]+[./]/;
+/**
+ * `gpt-<major>` with an optional 1–2 digit minor after `.` or `-`. The
+ * lookahead keeps a date suffix (`gpt-5-2025-08-07`) from reading as a minor.
+ */
+const GPT_VERSION = /^gpt-(\d+)(?:[.-](\d{1,2})(?!\d))?/;
+
+/**
+ * Responses-only for an untabled id: any codex variant, GPT-6 and newer, and
+ * GPT-5.5 and newer (dot- or dash-separated minor). Everything else uses
+ * chat-completions. Mirrors the Responses families opencode-dynamic-models.ts
+ * records; kept local because src/cli must not import from an agent plugin.
+ */
+function isResponsesOnlyGpt(id: string): boolean {
+  const name = id.trim().toLowerCase().replace(VENDOR_PREFIX, '');
+  if (name.includes('codex')) return true;
+  const match = name.match(GPT_VERSION);
+  if (match === null) return false;
+  const major = Number(match[1]);
+  const minor = match[2] === undefined ? 0 : Number(match[2]);
+  return major > 5 || (major === 5 && minor >= MIN_RESPONSES_GPT_5_MINOR);
+}
+
+/**
+ * Conservative capability entry for a tenant model with no capability-table
+ * family. No reasoning effort, no custom headers, modest token limits. A
+ * Responses model is always stateless (zero data retention) so the proxy's
+ * Responses invariants still hold. Never `messages`: that needs per-family
+ * auth headers the table owns.
+ */
+export function buildDefaultVsCodeCapability(descriptor: TenantModelDescriptor): VsCodeCapabilityEntry {
+  const responses = isResponsesOnlyGpt(descriptor.id);
+  return {
+    family: descriptor.id,
+    apiType: responses ? 'responses' : 'chat-completions',
+    vision: descriptor.multimodal === true,
+    thinking: false,
+    toolCalling: descriptor.toolCalling !== false,
+    ...(responses ? { zeroDataRetentionEnabled: true } : {}),
+    maxInputTokens: DEFAULT_MAX_INPUT_TOKENS,
+    maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+  };
+}
+
+function pickTokenLimit(catalogValue: number | undefined, fallback: number): number {
+  return typeof catalogValue === 'number' && Number.isFinite(catalogValue) && catalogValue > 0
+    ? catalogValue
+    : fallback;
+}
+
+/**
+ * Resolve the token limits for a model entry. The output limit is the tenant
+ * catalog value when it is a finite number > 0, else the capability entry
+ * (table entry or default). The API input value is treated as the whole
+ * context window, so the resolved output limit is subtracted from it to make
+ * input plus output fit. When the catalog input is missing, or the
+ * subtraction is not positive, the entry's `maxInputTokens` is used.
+ */
+export function resolveVsCodeTokenLimits(
+  entry: VsCodeCapabilityEntry,
+  descriptor: TenantModelDescriptor
+): { maxInputTokens: number; maxOutputTokens: number } {
+  const maxOutputTokens = pickTokenLimit(descriptor.maxOutputTokens, entry.maxOutputTokens);
+  const catalogInput = pickTokenLimit(descriptor.maxInputTokens, 0);
+  const promptBudget = catalogInput - maxOutputTokens;
+  return {
+    maxInputTokens: promptBudget > 0 ? promptBudget : entry.maxInputTokens,
+    maxOutputTokens,
+  };
+}
