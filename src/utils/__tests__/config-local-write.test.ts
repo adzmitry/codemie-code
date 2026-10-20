@@ -12,6 +12,8 @@ import { ConfigLoader } from '../config.js';
 import { ConfigurationError } from '../errors.js';
 import { StorageScope, type MultiProviderConfig } from '../../env/types.js';
 import * as paths from '../paths.js';
+import { logger } from '../logger.js';
+import chalk from 'chalk';
 
 const TEST_DIR = path.join(process.cwd(), 'tmp-test-local-write');
 const GLOBAL_CONFIG_DIR = path.join(TEST_DIR, '.codemie');
@@ -426,6 +428,92 @@ describe('ConfigLoader local config writes', () => {
     it('rejects an unknown old name and lists the available profiles', async () => {
       await expect(ConfigLoader.renameProfile('nope', 'x', WORKING_DIR))
         .rejects.toThrow('Profile "nope" not found. Available profiles: work, personal');
+    });
+  });
+
+  describe('fallback warning', () => {
+    const originalIsTTY = process.stderr.isTTY;
+    const WARNING = `⚠ Local profile "gone" not found in ${LOCAL_CONFIG_PATH}; using global profile "work". Run: codemie profile switch`;
+    let consoleError: ReturnType<typeof vi.spyOn>;
+    let loggerWarn: ReturnType<typeof vi.spyOn>;
+
+    function setStderrTTY(value: boolean): void {
+      Object.defineProperty(process.stderr, 'isTTY', { value, configurable: true });
+    }
+
+    beforeEach(async () => {
+      ConfigLoader.resetFallbackWarningForTests();
+      consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      loggerWarn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      setStderrTTY(true);
+      await writeLocal({ version: 2, activeProfile: 'gone', profiles: {} });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process.stderr, 'isTTY', { value: originalIsTTY, configurable: true });
+      ConfigLoader.resetFallbackWarningForTests();
+    });
+
+    function printedWarnings(): string[] {
+      return consoleError.mock.calls.map(args => String(args[0])).filter(text => text.includes('Local profile'));
+    }
+
+    it('prints the warning exactly once on a TTY when enabled', async () => {
+      ConfigLoader.enableFallbackWarning();
+
+      await ConfigLoader.listProfiles(WORKING_DIR);
+      await ConfigLoader.load(WORKING_DIR);
+      await ConfigLoader.getActiveProfileName(WORKING_DIR);
+
+      expect(printedWarnings()).toEqual([chalk.yellow(WARNING)]);
+      expect(loggerWarn).toHaveBeenCalledWith(WARNING);
+    });
+
+    it('does not print when stderr is not a TTY, but still logs', async () => {
+      setStderrTTY(false);
+      ConfigLoader.enableFallbackWarning();
+
+      await ConfigLoader.getActiveProfileName(WORKING_DIR);
+
+      expect(printedWarnings()).toEqual([]);
+      expect(loggerWarn).toHaveBeenCalledWith(WARNING);
+    });
+
+    it('does not print when not enabled', async () => {
+      await ConfigLoader.getActiveProfileName(WORKING_DIR);
+
+      expect(printedWarnings()).toEqual([]);
+      expect(loggerWarn).toHaveBeenCalledWith(WARNING);
+    });
+
+    it('does not warn for activeProfile ""', async () => {
+      await writeLocal({ version: 2, activeProfile: '', profiles: {} });
+      ConfigLoader.enableFallbackWarning();
+
+      await ConfigLoader.getActiveProfileName(WORKING_DIR);
+
+      expect(printedWarnings()).toEqual([]);
+      expect(loggerWarn).not.toHaveBeenCalled();
+    });
+
+    it('does not warn with an explicit profile', async () => {
+      ConfigLoader.enableFallbackWarning();
+
+      await ConfigLoader.load(WORKING_DIR, { name: 'work' });
+
+      expect(printedWarnings()).toEqual([]);
+      expect(loggerWarn).not.toHaveBeenCalled();
+    });
+
+    it('uses the no-global-active wording when the global has no valid active profile', async () => {
+      await writeGlobal({ ...GLOBAL_CONFIG, activeProfile: 'missing' });
+      ConfigLoader.enableFallbackWarning();
+
+      await ConfigLoader.getActiveProfileName(WORKING_DIR);
+
+      expect(printedWarnings()).toEqual([
+        chalk.yellow(`⚠ Local profile "gone" not found in ${LOCAL_CONFIG_PATH} and no global profile is active. Run: codemie setup`)
+      ]);
     });
   });
 });

@@ -30,6 +30,8 @@ export function createProfileCommand(): Command {
 
   command
     .description('Manage provider profiles (lists profiles by default)')
+    // Interactive command: show the dangling local activeProfile warning (also for subcommands)
+    .hook('preAction', () => ConfigLoader.enableFallbackWarning())
     .action(async () => {
       // Default action: list profiles
       await listProfiles();

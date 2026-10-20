@@ -20,6 +20,7 @@ import {
 import { ProviderRegistry } from '../providers/index.js';
 import { getCodemieHome, getCodemiePath } from './paths.js';
 import { ConfigurationError } from './errors.js';
+import { logger } from './logger.js';
 
 // Re-export for backward compatibility
 export type { CodeMieConfigOptions, CodeMieIntegrationInfo, ConfigWithSource, ConfigWithSources };
@@ -113,7 +114,52 @@ export class ConfigLoader {
       ? localProfileName
       : null;
 
+    if (localProfileName && !localActiveProfileName) {
+      this.warnDanglingLocalProfile(localProfileName, workingDir, globalActiveProfileName);
+    }
+
     return localActiveProfileName ?? globalActiveProfileName;
+  }
+
+  // Fallback warning state: console output is opt-in per process (interactive
+  // commands only) and printed at most once; hooks and daemons only log it.
+  private static fallbackWarningEnabled = false;
+  private static fallbackWarningShown = false;
+  private static fallbackWarningLogged = false;
+
+  /**
+   * Let this process print the dangling local activeProfile warning to stderr.
+   * Call from user-facing commands only, never from hooks or background paths.
+   */
+  static enableFallbackWarning(): void {
+    this.fallbackWarningEnabled = true;
+  }
+
+  static resetFallbackWarningForTests(): void {
+    this.fallbackWarningEnabled = false;
+    this.fallbackWarningShown = false;
+    this.fallbackWarningLogged = false;
+  }
+
+  private static warnDanglingLocalProfile(
+    localProfileName: string,
+    workingDir: string,
+    globalActiveProfileName: string | null
+  ): void {
+    const localConfigPath = path.join(workingDir, this.LOCAL_CONFIG);
+    const message = globalActiveProfileName
+      ? `⚠ Local profile "${localProfileName}" not found in ${localConfigPath}; using global profile "${globalActiveProfileName}". Run: codemie profile switch`
+      : `⚠ Local profile "${localProfileName}" not found in ${localConfigPath} and no global profile is active. Run: codemie setup`;
+
+    if (!this.fallbackWarningLogged) {
+      logger.warn(message);
+      this.fallbackWarningLogged = true;
+    }
+
+    if (this.fallbackWarningEnabled && !this.fallbackWarningShown && process.stderr.isTTY) {
+      console.error(chalk.yellow(message));
+      this.fallbackWarningShown = true;
+    }
   }
 
   /**
