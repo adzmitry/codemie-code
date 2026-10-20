@@ -150,4 +150,82 @@ describe('ConfigLoader local config writes', () => {
       expect(await ConfigLoader.getActiveProfileName(WORKING_DIR)).toBe('work');
     });
   });
+
+  describe('profile ops keep local data', () => {
+    it('switch keeps codemieAssistants/workspace for a fill-shape file', async () => {
+      await writeLocal({ codemieAssistants: [{ slug: 'jira' }], workspace: { codeMieProject: 'p' } });
+
+      await expect(ConfigLoader.switchProfile('work', WORKING_DIR)).resolves.toBe(StorageScope.LOCAL);
+
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: 'work',
+        profiles: {},
+        codemieAssistants: [{ slug: 'jira' }],
+        workspace: { codeMieProject: 'p' }
+      });
+    });
+
+    it('switch refuses a legacy local file and leaves it byte-identical', async () => {
+      const content = JSON.stringify({ provider: 'openai', model: 'gpt' });
+      await writeLocalRaw(content);
+
+      await expect(ConfigLoader.switchProfile('work', WORKING_DIR)).rejects.toThrow(ConfigurationError);
+
+      expect(await fs.readFile(LOCAL_CONFIG_PATH, 'utf-8')).toBe(content);
+    });
+
+    it('deleting the last local profile writes activeProfile "" and keeps other keys', async () => {
+      await writeLocal({
+        version: 2,
+        activeProfile: 'team',
+        profiles: { team: { provider: 'sso' } },
+        codemieSkills: [{ slug: 's' }],
+        workspace: { codeMieProject: 'p' }
+      });
+
+      await expect(ConfigLoader.deleteProfile('team', WORKING_DIR)).resolves.toBe(StorageScope.LOCAL);
+
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: '',
+        profiles: {},
+        codemieSkills: [{ slug: 's' }],
+        workspace: { codeMieProject: 'p' }
+      });
+      expect(await ConfigLoader.getActiveProfileName(WORKING_DIR)).toBe('work');
+    });
+
+    it('after deleting the last local profile, deleting a global profile succeeds', async () => {
+      await writeLocal({ version: 2, activeProfile: 'team', profiles: { team: { provider: 'sso' } } });
+
+      await ConfigLoader.deleteProfile('team', WORKING_DIR);
+      await expect(ConfigLoader.deleteProfile('personal', WORKING_DIR)).resolves.toBe(StorageScope.GLOBAL);
+
+      const global = JSON.parse(await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8')) as MultiProviderConfig;
+      expect(global.profiles.personal).toBeUndefined();
+      expect(global.activeProfile).toBe('work');
+    });
+
+    it('deleting the global profile the local active points to, with no local profiles, writes ""', async () => {
+      await writeLocal({ version: 2, activeProfile: 'work', profiles: {}, workspace: { codeMieProject: 'p' } });
+
+      await expect(ConfigLoader.deleteProfile('work', WORKING_DIR)).resolves.toBe(StorageScope.GLOBAL);
+
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: '',
+        profiles: {},
+        workspace: { codeMieProject: 'p' }
+      });
+    });
+
+    it('listProfiles marks the global active profile when the local active is dangling', async () => {
+      await writeLocal({ version: 2, activeProfile: 'gone', profiles: {} });
+
+      const profiles = await ConfigLoader.listProfiles(WORKING_DIR);
+
+      expect(profiles.filter(p => p.active).map(p => p.name)).toEqual(['work']);
+    });
+  });
 });
