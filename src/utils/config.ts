@@ -1027,30 +1027,49 @@ export class ConfigLoader {
   }
 
   /**
-   * Rename a profile
+   * Rename a profile in the scope that owns it.
+   * The new name must not exist in either scope. Renaming a global profile also
+   * repairs this directory's local activeProfile reference to it.
    */
-  static async renameProfile(oldName: string, newName: string): Promise<void> {
-    const config = await this.loadMultiProviderConfig();
+  static async renameProfile(
+    oldName: string,
+    newName: string,
+    workingDir: string = process.cwd()
+  ): Promise<StorageScope> {
+    const scope = await this.getProfileScope(oldName, workingDir);
 
-    if (!config.profiles[oldName]) {
-      throw new Error(`Profile "${oldName}" not found`);
+    const localConfig = await this.loadLocalMultiProviderConfigIfAvailable(workingDir);
+    const globalConfig = await this.loadMultiProviderConfig();
+    if (localConfig?.profiles[newName]) {
+      throw new Error(`Profile "${newName}" already exists in local config`);
+    }
+    if (globalConfig.profiles[newName]) {
+      throw new Error(`Profile "${newName}" already exists in global config`);
     }
 
-    if (config.profiles[newName]) {
-      throw new Error(`Profile "${newName}" already exists`);
+    const renameIn = (config: MultiProviderConfig): void => {
+      config.profiles[newName] = { ...config.profiles[oldName], name: newName };
+      delete config.profiles[oldName];
+      if (config.activeProfile === oldName) {
+        config.activeProfile = newName;
+      }
+    };
+
+    if (scope === StorageScope.LOCAL) {
+      await this.updateLocalConfig(workingDir, renameIn);
+      return scope;
     }
 
-    // Copy profile with new name
-    const profile = { ...config.profiles[oldName], name: newName };
-    config.profiles[newName] = profile;
-    delete config.profiles[oldName];
+    renameIn(globalConfig);
+    await this.saveMultiProviderConfig(globalConfig);
 
-    // Update active profile if needed
-    if (config.activeProfile === oldName) {
-      config.activeProfile = newName;
+    if (localConfig?.activeProfile === oldName) {
+      await this.updateLocalConfig(workingDir, config => {
+        config.activeProfile = newName;
+      });
     }
 
-    await this.saveMultiProviderConfig(config);
+    return scope;
   }
 
   /**

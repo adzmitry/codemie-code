@@ -450,8 +450,9 @@ function createRenameCommand(): Command {
     .argument('<new-name>', 'New profile name')
     .action(async (oldName: string, newName: string) => {
       try {
-        await ConfigLoader.renameProfile(oldName, newName);
-        console.log(chalk.green(`\n✓ Profile renamed from "${oldName}" to "${newName}"\n`));
+        const scope = await ConfigLoader.renameProfile(oldName, newName, process.cwd());
+        const location = scope === 'local' ? 'local config' : 'global config';
+        console.log(chalk.green(`\n✓ Profile "${oldName}" renamed to "${newName}" in ${location}\n`));
       } catch (error: unknown) {
         logger.error('Failed to rename profile:', error);
         process.exit(1);

@@ -357,4 +357,75 @@ describe('ConfigLoader local config writes', () => {
       expect((await readLocal() as typeof TEAM_LOCAL).profiles.solo).toEqual({ name: 'solo', provider: 'sso' });
     });
   });
+
+  describe('renameProfile', () => {
+    it('renames a local-only profile, keeps other keys, updates the local activeProfile', async () => {
+      await writeLocal({
+        version: 2,
+        activeProfile: 'team',
+        profiles: { team: { name: 'team', provider: 'sso' }, other: { provider: 'sso' } },
+        codemieAssistants: [{ slug: 'jira' }]
+      });
+
+      await expect(ConfigLoader.renameProfile('team', 'squad', WORKING_DIR)).resolves.toBe(StorageScope.LOCAL);
+
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: 'squad',
+        profiles: { other: { provider: 'sso' }, squad: { name: 'squad', provider: 'sso' } },
+        codemieAssistants: [{ slug: 'jira' }]
+      });
+      const global = JSON.parse(await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8')) as MultiProviderConfig;
+      expect(global).toEqual(GLOBAL_CONFIG);
+    });
+
+    it('renames a global profile and repairs the cwd local activeProfile reference', async () => {
+      await writeLocal({ version: 2, activeProfile: 'work', profiles: {}, workspace: { codeMieProject: 'p' } });
+
+      await expect(ConfigLoader.renameProfile('work', 'job', WORKING_DIR)).resolves.toBe(StorageScope.GLOBAL);
+
+      const global = JSON.parse(await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8')) as MultiProviderConfig;
+      expect(Object.keys(global.profiles).sort()).toEqual(['job', 'personal']);
+      expect(global.profiles.job).toEqual({ ...GLOBAL_CONFIG.profiles.work, name: 'job' });
+      expect(global.activeProfile).toBe('job');
+      expect(await readLocal()).toEqual({
+        version: 2,
+        activeProfile: 'job',
+        profiles: {},
+        workspace: { codeMieProject: 'p' }
+      });
+    });
+
+    it('renames a global profile without a local file and creates none', async () => {
+      await fs.rm(LOCAL_CONFIG_PATH, { force: true });
+
+      await expect(ConfigLoader.renameProfile('personal', 'home', WORKING_DIR)).resolves.toBe(StorageScope.GLOBAL);
+
+      await expect(fs.access(LOCAL_CONFIG_PATH)).rejects.toThrow();
+    });
+
+    it('rejects a new name that exists in the other scope and leaves both files unchanged', async () => {
+      const local = JSON.stringify({ version: 2, activeProfile: 'team', profiles: { team: { provider: 'sso' } } });
+      await writeLocalRaw(local);
+      const global = await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8');
+
+      await expect(ConfigLoader.renameProfile('work', 'team', WORKING_DIR))
+        .rejects.toThrow('Profile "team" already exists in local config');
+      await expect(ConfigLoader.renameProfile('team', 'personal', WORKING_DIR))
+        .rejects.toThrow('Profile "personal" already exists in global config');
+
+      expect(await fs.readFile(LOCAL_CONFIG_PATH, 'utf-8')).toBe(local);
+      expect(await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8')).toBe(global);
+    });
+
+    it('rejects rename onto the same name', async () => {
+      await expect(ConfigLoader.renameProfile('work', 'work', WORKING_DIR))
+        .rejects.toThrow('Profile "work" already exists in global config');
+    });
+
+    it('rejects an unknown old name and lists the available profiles', async () => {
+      await expect(ConfigLoader.renameProfile('nope', 'x', WORKING_DIR))
+        .rejects.toThrow('Profile "nope" not found. Available profiles: work, personal');
+    });
+  });
 });
