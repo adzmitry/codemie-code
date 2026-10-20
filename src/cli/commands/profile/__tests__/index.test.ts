@@ -227,6 +227,49 @@ describe('profile command errors', () => {
     expect(exitSpy).toHaveBeenCalledWith(0);
   });
 
+  it('delete success prints the owning scope', async () => {
+    const ConfigLoader = await loadConfigLoader();
+    ConfigLoader.getProfileScope.mockResolvedValue('global');
+    ConfigLoader.deleteProfile.mockResolvedValue('global');
+    ConfigLoader.listProfiles.mockResolvedValue([{ name: 'team', active: true, profile: { provider: 'sso' }, source: 'local' }]);
+    ConfigLoader.getActiveProfileName.mockResolvedValue('team');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await createProfileCommand().parseAsync(['delete', 'personal', '--yes'], { from: 'user' });
+
+    expect(ConfigLoader.deleteProfile).toHaveBeenCalledWith('personal', process.cwd());
+    expect(logSpy).toHaveBeenCalledWith('[green]\n✓ Profile "personal" deleted from global config\n[/green]');
+  });
+
+  it('status prints the red reason and exits 1', async () => {
+    const ConfigLoader = await loadConfigLoader();
+    ConfigLoader.load.mockRejectedValue(new Error('Local config x has an unsupported format (invalid JSON); it was left unchanged.'));
+    spyExit();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(createProfileCommand().parseAsync(['status'], { from: 'user' })).rejects.toThrow('process.exit:1');
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[red]✗ Failed to get profile status: Local config x has an unsupported format (invalid JSON); it was left unchanged.[/red]'
+    );
+  });
+
+  it('Ctrl+C in an inquirer prompt prints Cancelled. and exits 0', async () => {
+    const ConfigLoader = await loadConfigLoader();
+    const exitPromptError = Object.assign(new Error('User force closed the prompt with 0 null'), { name: 'ExitPromptError' });
+    ConfigLoader.switchProfile.mockRejectedValue(exitPromptError);
+    const exitSpy = spyExit();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(createProfileCommand().parseAsync(['switch', 'work'], { from: 'user' }))
+      .rejects.toThrow('process.exit:0');
+
+    expect(logSpy).toHaveBeenCalledWith('[yellow]\nCancelled.\n[/yellow]');
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
   it('enables the fallback warning for profile subcommands', async () => {
     const ConfigLoader = await loadConfigLoader();
     ConfigLoader.renameProfile.mockResolvedValue('global');
