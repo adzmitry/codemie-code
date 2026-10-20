@@ -62,6 +62,15 @@ project context, but it cannot replace the selected provider, model, or credenti
 
 **Key rule**: Profile names are unique across the system. `profile switch` stores the active profile selection in local config when `.codemie/` exists (for this repository only), or in global config otherwise; the referenced profile can be defined in either global or local scope. `profile delete` deletes from whichever scope (global or local) defines the profile, and repairs any active profile references.
 
+**Local config writes and profile scope rules**:
+
+- Every write to `.codemie/codemie-cli.config.json` (switch, delete, rename, setup Local save, Local skills/assistants registration) is a read-modify-write through `ConfigLoader.updateLocalConfig()`. It keeps `codemieAssistants`, `codemieSkills`, `workspace`, other profiles and unknown keys. A versionless object without legacy fields (for example an assistants/workspace-only file) is filled with `version: 2`, `profiles: {}` and `activeProfile: ""`. A file it cannot classify safely (invalid JSON, legacy v1, another `version`, a non-object `profiles` entry, a non-string `activeProfile`) is refused with a `ConfigurationError` and left byte-identical.
+- `activeProfile: ""` in the local file means "no local choice: follow the global active profile". New local files created by registration, and delete repairs that leave no local profile, write `""`.
+- A non-empty local `activeProfile` that exists in neither scope falls back to the global active profile and is logged. Profile commands and agent launches also print one warning per process to stderr, only on an interactive terminal: `⚠ Local profile "<name>" not found in <path>; using global profile "<global>". Run: codemie profile switch`. Hooks and background processes stay silent; `--profile` never warns.
+- `profile rename` renames in the scope that owns the profile, rejects a new name that exists in either scope, and after a global rename repairs this directory's local `activeProfile` reference.
+- `codemie setup` with Local storage merges the profile into the local file. An update keeps the local active profile unless it is `""` or dangling. A new profile becomes active when it is the only local profile (or the active one is `""`/dangling); otherwise setup asks.
+- Profile, auth and setup command failures print `✗ <action>: <reason>` in red and exit 1; cancelling a profile picker prints `Cancelled.` and exits 0.
+
 `file:src/utils/config.ts` — `loadWithSources()` implements the merge.
 
 ---
@@ -93,6 +102,9 @@ await ConfigLoader.initProjectConfig(process.cwd(), {
 | `listProfiles()` | `Promise<ProfileEntry[]>` |
 | `loadWithSources(workingDir?, cliOverrides?)` | `Promise<ConfigWithSources>` |
 | `initProjectConfig(workingDir, overrides?)` | `Promise<void>` |
+| `updateLocalConfig(workingDir, mutate)` | `Promise<MultiProviderConfig>` |
+| `saveLocalProfile(workingDir, name, input, { isUpdate })` | `Promise<{ activated: boolean }>` |
+| `switchProfile(name, workingDir?)` / `deleteProfile(name, workingDir?)` / `renameProfile(old, new, workingDir?)` | `Promise<StorageScope>` |
 | `showWithSources(workingDir?)` | `Promise<void>` (CLI utility) |
 
 ### Key Types
