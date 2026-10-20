@@ -517,3 +517,59 @@ describe('ConfigLoader local config writes', () => {
     });
   });
 });
+
+describe('ConfigLoader global config writes', () => {
+  const HOME_DIR = path.join(TEST_DIR, '.codemie');
+  const GLOBAL_PATH = path.join(HOME_DIR, 'codemie-cli.config.json');
+  const NO_LOCAL_DIR = path.join(TEST_DIR, 'no-local');
+
+  beforeEach(async () => {
+    await fs.mkdir(HOME_DIR, { recursive: true });
+    await fs.mkdir(NO_LOCAL_DIR, { recursive: true });
+    vi.spyOn(paths, 'getCodemieHome').mockReturnValue(HOME_DIR);
+    vi.spyOn(paths, 'getCodemiePath').mockImplementation((subpath: string) => path.join(HOME_DIR, subpath));
+  });
+
+  afterEach(async () => {
+    await fs.rm(TEST_DIR, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['a null profile entry', JSON.stringify({ version: 2, activeProfile: 'work', profiles: { work: { provider: 'sso' }, broken: null } })],
+    ['a non-string activeProfile', JSON.stringify({ version: 2, activeProfile: 1, profiles: { work: { provider: 'sso' } } })],
+    ['an unknown version', JSON.stringify({ version: 3, activeProfile: 'work', profiles: { work: { provider: 'sso' } } })],
+    ['unparseable JSON', '{"version":2,'],
+    ['a UTF-8 BOM', String.fromCharCode(0xfeff) + JSON.stringify(GLOBAL_CONFIG)]
+  ])('refuses to overwrite a global file with %s and leaves it byte-identical', async (_label, content) => {
+    await fs.writeFile(GLOBAL_PATH, content);
+
+    await expect(ConfigLoader.saveProfile('new', { provider: 'sso' } as never)).rejects.toThrow(ConfigurationError);
+    await expect(ConfigLoader.switchProfile('work', NO_LOCAL_DIR)).rejects.toThrow();
+
+    expect(await fs.readFile(GLOBAL_PATH, 'utf-8')).toBe(content);
+  });
+
+  it('names the global file and says it was left unchanged', async () => {
+    await fs.writeFile(GLOBAL_PATH, JSON.stringify({ version: 2, activeProfile: 'work', profiles: { broken: null } }));
+
+    await expect(ConfigLoader.saveProfile('new', { provider: 'sso' } as never))
+      .rejects.toThrow(`Global config ${GLOBAL_PATH} has an unsupported format`);
+  });
+
+  it('still creates a missing global file', async () => {
+    await ConfigLoader.saveProfile('new', { provider: 'sso' } as never);
+
+    const saved = JSON.parse(await fs.readFile(GLOBAL_PATH, 'utf-8')) as MultiProviderConfig;
+    expect(saved.activeProfile).toBe('new');
+  });
+
+  it('still migrates a legacy global file to v2 on save', async () => {
+    await fs.writeFile(GLOBAL_PATH, JSON.stringify({ provider: 'openai', model: 'gpt' }));
+
+    await ConfigLoader.saveProfile('new', { provider: 'sso' } as never);
+
+    const saved = JSON.parse(await fs.readFile(GLOBAL_PATH, 'utf-8')) as MultiProviderConfig;
+    expect(Object.keys(saved.profiles).sort()).toEqual(['default', 'new']);
+  });
+});

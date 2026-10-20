@@ -749,7 +749,50 @@ export class ConfigLoader {
    * Save multi-provider config
    */
   static async saveMultiProviderConfig(config: MultiProviderConfig): Promise<void> {
+    await this.assertGlobalConfigWritable();
     await this.saveGlobalConfig(config as any);
+  }
+
+  /**
+   * Refuse to overwrite a global file that loadMultiProviderConfig() could not
+   * read as v2 or legacy: the config being saved was then built from an empty
+   * structure, and writing it would drop every existing profile.
+   */
+  private static async assertGlobalConfigWritable(): Promise<void> {
+    let content: string;
+    try {
+      content = await fs.readFile(this.GLOBAL_CONFIG, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        return;
+      }
+      throw error;
+    }
+    if (content.trim() === '') {
+      return;
+    }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(content);
+    } catch {
+      throw this.unsupportedGlobalConfig('invalid JSON');
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw this.unsupportedGlobalConfig('not a JSON object');
+    }
+    const version = (raw as Record<string, unknown>).version;
+    if (version !== undefined && !isMultiProviderConfig(raw)) {
+      throw this.unsupportedGlobalConfig(
+        version === 2 ? 'invalid "profiles" or "activeProfile"' : `unsupported version ${String(version)}`
+      );
+    }
+  }
+
+  private static unsupportedGlobalConfig(reason: string): ConfigurationError {
+    return new ConfigurationError(
+      `Global config ${this.GLOBAL_CONFIG} has an unsupported format (${reason}); it was left unchanged.`
+    );
   }
 
   static async saveUserEmail(email: string): Promise<void> {
