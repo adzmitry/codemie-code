@@ -7,6 +7,7 @@ import { ProfileDisplay } from './display.js';
 import { ProviderRegistry } from '../../../providers/core/registry.js';
 import { handleAuthValidationFailure } from '../../../providers/core/auth-validation.js';
 import { createLoginCommand, createLogoutCommand, createRefreshCommand } from './auth.js';
+import { exitWithCommandError, ProfileSelectionCancelledError } from './command-error.js';
 import { buildSingleChoiceRow, buildTopLine } from '../shared/selection/ui.js';
 import { ANSI, KEY } from '../shared/selection/constants.js';
 import { COLOR } from '../shared/constants.js';
@@ -69,8 +70,7 @@ async function listProfiles(): Promise<void> {
       global: globalWorkspace.codeMieUrl
     });
   } catch (error: unknown) {
-    logger.error('Failed to list profiles:', error);
-    process.exit(1);
+    exitWithCommandError('Failed to list profiles', error);
   }
 }
 
@@ -92,8 +92,7 @@ function createStatusCommand(): Command {
           await handleStatus();
         }
       } catch (error: unknown) {
-        logger.error('Failed to get profile status:', error);
-        process.exit(1);
+        exitWithCommandError('Failed to get profile status', error);
       }
     });
 
@@ -290,7 +289,7 @@ async function promptProfileSelectionCustom(message: string, profiles: ProfileIn
         case KEY.ESC:
         case KEY.CTRL_C:
           cleanup();
-          reject(new Error('Profile selection cancelled.'));
+          reject(new ProfileSelectionCancelledError());
           break;
         default:
           break;
@@ -361,8 +360,7 @@ function createSwitchCommand(): Command {
         const location = scope === 'local' ? 'local config' : 'global config';
         console.log(chalk.green(`\n✓ Switched to profile "${profileName}" in ${location}\n`));
       } catch (error: unknown) {
-        logger.error('Failed to switch profile:', error);
-        process.exit(1);
+        exitWithCommandError('Failed to switch profile', error);
       }
     });
 
@@ -435,8 +433,7 @@ function createDeleteCommand(): Command {
           }
         }
       } catch (error: unknown) {
-        logger.error('Failed to delete profile:', error);
-        process.exit(1);
+        exitWithCommandError('Failed to delete profile', error);
       }
     });
 
@@ -456,8 +453,7 @@ function createRenameCommand(): Command {
         const location = scope === 'local' ? 'local config' : 'global config';
         console.log(chalk.green(`\n✓ Profile "${oldName}" renamed to "${newName}" in ${location}\n`));
       } catch (error: unknown) {
-        logger.error('Failed to rename profile:', error);
-        process.exit(1);
+        exitWithCommandError('Failed to rename profile', error);
       }
     });
 

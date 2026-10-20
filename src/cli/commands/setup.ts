@@ -4,6 +4,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigLoader } from '../../utils/config.js';
 import { logger } from '../../utils/logger.js';
+import { exitWithCommandError } from './profile/command-error.js';
 import { ProviderRegistry } from '../../providers/index.js';
 import {
   getAllProviderChoices,
@@ -41,13 +42,20 @@ export function createSetupCommand(): Command {
       try {
         await runSetupWizard(options.force);
       } catch (error: unknown) {
-        logger.error('Setup failed:', error);
-        process.exit(1);
+        if (error instanceof Error && displayedSetupErrors.has(error)) {
+          // Already shown with remediation by displaySetupError()
+          logger.error('Setup failed:', error);
+          process.exit(1);
+        }
+        exitWithCommandError('Setup failed', error);
       }
     });
 
   return command;
 }
+
+// Errors the provider flow already showed via displaySetupError()
+const displayedSetupErrors = new WeakSet<Error>();
 
 async function runSetupWizard(force?: boolean): Promise<void> {
   // Show ecosystem introduction
@@ -383,6 +391,9 @@ async function handlePluginSetup(
     const errorMessage = error instanceof Error ? error.message : String(error);
     const providerTemplate = ProviderRegistry.getProvider(providerName);
     displaySetupError(new Error(errorMessage), providerTemplate?.setupInstructions);
+    if (error instanceof Error) {
+      displayedSetupErrors.add(error);
+    }
     throw error;
   }
 }
