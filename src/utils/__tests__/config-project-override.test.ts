@@ -11,6 +11,17 @@ import { ConfigLoader } from '../config.js';
 import type { MultiProviderConfig, CodeMieIntegrationInfo } from '../../env/types.js';
 import * as paths from '../paths.js';
 
+// The real logger keeps a write stream open under the mocked CODEMIE home,
+// which blocks deleting TEST_DIR on Windows (EPERM) and breaks later tests.
+vi.mock('../logger.js', () => ({
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  }
+}));
+
 // Test utilities
 const TEST_DIR = path.join(process.cwd(), 'tmp-test-config');
 const GLOBAL_CONFIG_DIR = path.join(TEST_DIR, '.codemie');

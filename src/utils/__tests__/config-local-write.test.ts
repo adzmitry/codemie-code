@@ -15,6 +15,17 @@ import * as paths from '../paths.js';
 import { logger } from '../logger.js';
 import chalk from 'chalk';
 
+// The real logger keeps a write stream open under the mocked CODEMIE home,
+// which blocks deleting TEST_DIR on Windows (EPERM) and breaks later tests.
+vi.mock('../logger.js', () => ({
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  }
+}));
+
 const TEST_DIR = path.join(process.cwd(), 'tmp-test-local-write');
 const GLOBAL_CONFIG_DIR = path.join(TEST_DIR, '.codemie');
 const GLOBAL_CONFIG_PATH = path.join(GLOBAL_CONFIG_DIR, 'codemie-cli.config.json');
@@ -444,6 +455,7 @@ describe('ConfigLoader local config writes', () => {
     beforeEach(async () => {
       ConfigLoader.resetFallbackWarningForTests();
       consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.mocked(logger.warn).mockClear();
       loggerWarn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
       setStderrTTY(true);
       await writeLocal({ version: 2, activeProfile: 'gone', profiles: {} });
