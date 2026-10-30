@@ -1,5 +1,6 @@
 /**
- * Tests for deriveExpiresAt — JWT exp extraction from cookie dict.
+ * Tests for deriveExpiresAt — JWT exp extraction from cookie dict — and
+ * hasUsableSsoCredential — the cookies-or-authorization usability check.
  * @group unit
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -19,7 +20,7 @@ vi.mock('open', () => ({ default: vi.fn() }));
 vi.mock('@/utils/analytics-auth-status.js', () => ({ clearAnalyticsAuthStatus: vi.fn() }));
 vi.mock('@/providers/core/credential-owner.js', () => ({ withVerifiedOwner: vi.fn() }));
 
-import { deriveExpiresAt, effectiveExpiresAt, CodeMieSSO } from '../sso.auth.js';
+import { deriveExpiresAt, effectiveExpiresAt, CodeMieSSO, hasUsableSsoCredential } from '../sso.auth.js';
 
 function makeJwt(exp: number): string {
   const payload = { sub: 'uid', email: 'u@test.com', exp, iss: 'codemie-local' };
@@ -134,5 +135,36 @@ describe('CodeMieSSO.authenticate storage', () => {
     expect(storeSSOCredentials).toHaveBeenCalledTimes(1);
     const stored = storeSSOCredentials.mock.calls[0][0];
     expect(stored).not.toHaveProperty('expiresAt');
+  });
+});
+
+describe('hasUsableSsoCredential', () => {
+  it('is usable with non-empty cookies and no authorization', () => {
+    expect(hasUsableSsoCredential({ session: 'abc' }, undefined)).toBe(true);
+  });
+
+  it('is usable with a non-empty authorization fallback and no cookies at all', () => {
+    expect(hasUsableSsoCredential(undefined, 'backend-issued-value')).toBe(true);
+  });
+
+  it('is usable with a non-empty authorization fallback and empty cookies (reverse proxy strips cookies)', () => {
+    expect(hasUsableSsoCredential({}, 'backend-issued-value')).toBe(true);
+  });
+
+  it('is usable when both cookies and authorization are present', () => {
+    expect(hasUsableSsoCredential({ session: 'abc' }, 'backend-issued-value')).toBe(true);
+  });
+
+  it('is not usable with empty cookies and no authorization', () => {
+    expect(hasUsableSsoCredential({}, undefined)).toBe(false);
+  });
+
+  it('is not usable with no cookies at all and no authorization', () => {
+    expect(hasUsableSsoCredential(undefined, undefined)).toBe(false);
+  });
+
+  it('is not usable when authorization is an empty or whitespace-only string', () => {
+    expect(hasUsableSsoCredential({}, '')).toBe(false);
+    expect(hasUsableSsoCredential({}, '   ')).toBe(false);
   });
 });

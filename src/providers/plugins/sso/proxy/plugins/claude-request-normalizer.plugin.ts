@@ -340,7 +340,7 @@ class ClaudeRequestNormalizerInterceptor implements ProxyInterceptor {
       // Whole catalog, not one project's: this only looks up metadata for requests
       // the client already sends, so a model outside the project must still resolve.
       const models = 'cookies' in credentials
-        ? await fetchCodeMieLlmModels(apiUrl, credentials.cookies, undefined)
+        ? await fetchCodeMieLlmModels(apiUrl, credentials.cookies, undefined, credentials.authorization)
         : await fetchCodeMieLlmModels(apiUrl, credentials.token, undefined);
 
       this.availableModels = models

@@ -65,7 +65,7 @@ export class SSOModelProxy extends BaseModelProxy {
         throw new Error('No SSO credentials found. Run: codemie profile login');
       }
 
-      return await this.fetchModelsFromAPI(credentials.apiUrl, credentials.cookies);
+      return await this.fetchModelsFromAPI(credentials.apiUrl, credentials.cookies, undefined, credentials.authorization);
     } catch (error) {
       logger.debug('Failed to list SSO models:', error);
       throw error;
@@ -82,14 +82,23 @@ export class SSOModelProxy extends BaseModelProxy {
    * store write and reusing the same authenticated session.
    */
   async fetchModels(config: CodeMieConfigOptions): Promise<ModelInfo[]> {
-    const suppliedCookies = (config as CodeMieConfigOptions & { cookies?: Record<string, string> }).cookies;
+    const suppliedConfig = config as CodeMieConfigOptions & {
+      cookies?: Record<string, string>;
+      authorization?: string;
+    };
+    const suppliedCookies = suppliedConfig.cookies;
 
     // Supplied cookies come with the auth result's API URL (config.baseUrl);
     // codeMieUrl is the org/frontend URL and serves HTML, not the API.
     if (suppliedCookies && config.baseUrl) {
       // Real API/network errors propagate so setup.js can show an actionable
       // message instead of silently reporting "Found 0 available models".
-      return await this.fetchModelsFromAPI(config.baseUrl, suppliedCookies, config.codeMieProject ?? undefined);
+      return await this.fetchModelsFromAPI(
+        config.baseUrl,
+        suppliedCookies,
+        config.codeMieProject ?? undefined,
+        suppliedConfig.authorization
+      );
     }
 
     // Profile baseUrl first, workspace codeMieUrl as fallback
@@ -108,7 +117,12 @@ export class SSOModelProxy extends BaseModelProxy {
       throw new Error('No CodeMie URL configured');
     }
 
-    return await this.fetchModelsFromAPI(apiUrl, credentials.cookies, config.codeMieProject ?? undefined);
+    return await this.fetchModelsFromAPI(
+      apiUrl,
+      credentials.cookies,
+      config.codeMieProject ?? undefined,
+      credentials.authorization
+    );
   }
 
   /**
@@ -136,7 +150,9 @@ export class SSOModelProxy extends BaseModelProxy {
       // Fetch user-level integrations from the SSO settings endpoint
       const allIntegrations = await fetchCodeMieIntegrations(
           apiUrl,
-          credentials.cookies
+          credentials.cookies,
+          CODEMIE_ENDPOINTS.USER_SETTINGS,
+          credentials.authorization
       );
 
       // Filter by project_name if specified
@@ -178,10 +194,11 @@ export class SSOModelProxy extends BaseModelProxy {
   private async fetchModelsFromAPI(
     apiUrl: string,
     cookies: Record<string, string>,
-    project?: string
+    project?: string,
+    authorization?: string
   ): Promise<ModelInfo[]> {
     try {
-      const llmModels = await fetchCodeMieLlmModels(apiUrl, cookies, project);
+      const llmModels = await fetchCodeMieLlmModels(apiUrl, cookies, project, authorization);
 
       const models: ModelInfo[] = [];
       for (const model of llmModels) {

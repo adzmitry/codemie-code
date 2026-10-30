@@ -145,7 +145,7 @@ describe('validateGeminiModel SSO lookup (profile baseUrl first)', () => {
     await validateGeminiModel({ CODEMIE_PROFILE_CONFIG: profile, CODEMIE_MODEL: 'gemini-3-pro' });
 
     expect(ssoMock.getStoredCredentials).toHaveBeenCalledWith('https://profile.example.com');
-    expect(fetchMock).toHaveBeenCalledWith(creds.apiUrl, creds.cookies, undefined);
+    expect(fetchMock).toHaveBeenCalledWith(creds.apiUrl, creds.cookies, undefined, creds.authorization);
   });
 
   it('ignores the proxy-rewritten CODEMIE_BASE_URL', async () => {

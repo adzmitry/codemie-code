@@ -298,7 +298,8 @@ function modelsFetchError(statusCode: number | undefined, statusMessage: string 
 export function fetchCodeMieLlmModels(
   apiUrl: string,
   cookies: Record<string, string>,
-  project: string | undefined
+  project: string | undefined,
+  authorization?: string
 ): Promise<LlmModel[]>;
 export function fetchCodeMieLlmModels(
   apiUrl: string,
@@ -308,10 +309,11 @@ export function fetchCodeMieLlmModels(
 export async function fetchCodeMieLlmModels(
   apiUrl: string,
   auth: Record<string, string> | string,
-  project: string | undefined
+  project: string | undefined,
+  authorization?: string
 ): Promise<LlmModel[]> {
 /* eslint-enable no-redeclare */
-  const headers = buildAuthHeaders(auth);
+  const headers = buildAuthHeaders(auth, authorization);
   const url = buildLlmModelsUrl(apiUrl, project);
 
   const client = new HTTPClient({
@@ -341,7 +343,8 @@ export async function fetchCodeMieLlmModels(
 export function fetchCodeMieModels(
   apiUrl: string,
   cookies: Record<string, string>,
-  project: string | undefined
+  project: string | undefined,
+  authorization?: string
 ): Promise<string[]>;
 export function fetchCodeMieModels(
   apiUrl: string,
@@ -351,10 +354,11 @@ export function fetchCodeMieModels(
 export async function fetchCodeMieModels(
   apiUrl: string,
   auth: Record<string, string> | string,
-  project: string | undefined
+  project: string | undefined,
+  authorization?: string
 ): Promise<string[]> {
 /* eslint-enable no-redeclare */
-  const headers = buildAuthHeaders(auth);
+  const headers = buildAuthHeaders(auth, authorization);
   const url = buildLlmModelsUrl(apiUrl, project);
 
   const client = new HTTPClient({
@@ -410,7 +414,8 @@ export async function fetchCodeMieModels(
 /* eslint-disable no-redeclare */
 export function fetchApplicationDetails(
   apiUrl: string,
-  cookies: Record<string, string>
+  cookies: Record<string, string>,
+  authorization?: string
 ): Promise<string[]>;
 export function fetchApplicationDetails(
   apiUrl: string,
@@ -418,10 +423,11 @@ export function fetchApplicationDetails(
 ): Promise<string[]>;
 export async function fetchApplicationDetails(
   apiUrl: string,
-  auth: Record<string, string> | string
+  auth: Record<string, string> | string,
+  authorization?: string
 ): Promise<string[]> {
   try {
-    const headers = buildAuthHeaders(auth);
+    const headers = buildAuthHeaders(auth, authorization);
     const url = `${apiUrl}${CODEMIE_ENDPOINTS.ADMIN_APPLICATIONS}?limit=1000`;
 
     const client = new HTTPClient({
@@ -455,7 +461,8 @@ export async function fetchApplicationDetails(
 export function fetchCodeMieIntegrations(
   apiUrl: string,
   cookies: Record<string, string>,
-  endpointPath?: string
+  endpointPath?: string,
+  authorization?: string
 ): Promise<CodeMieIntegration[]>;
 export function fetchCodeMieIntegrations(
   apiUrl: string,
@@ -465,7 +472,8 @@ export function fetchCodeMieIntegrations(
 export async function fetchCodeMieIntegrations(
   apiUrl: string,
   auth: Record<string, string> | string,
-  endpointPath: string = CODEMIE_ENDPOINTS.USER_SETTINGS
+  endpointPath: string = CODEMIE_ENDPOINTS.USER_SETTINGS,
+  authorization?: string
 ): Promise<CodeMieIntegration[]> {
   const allIntegrations: CodeMieIntegration[] = [];
   let currentPage = 0;
@@ -491,7 +499,7 @@ export async function fetchCodeMieIntegrations(
         console.log(`[DEBUG] Fetching integrations from: ${fullUrl}`);
       }
 
-      const pageIntegrations = await fetchIntegrationsPage(fullUrl, auth);
+      const pageIntegrations = await fetchIntegrationsPage(fullUrl, auth, authorization);
 
       if (pageIntegrations.length === 0) {
         hasMorePages = false;
@@ -530,8 +538,12 @@ export async function fetchCodeMieIntegrations(
 /**
  * Fetch single page of integrations - supports both cookies and JWT
  */
-async function fetchIntegrationsPage(fullUrl: string, auth: Record<string, string> | string): Promise<CodeMieIntegration[]> {
-  const headers = buildAuthHeaders(auth);
+async function fetchIntegrationsPage(
+  fullUrl: string,
+  auth: Record<string, string> | string,
+  authorization?: string
+): Promise<CodeMieIntegration[]> {
+  const headers = buildAuthHeaders(auth, authorization);
 
   const client = new HTTPClient({
     timeout: 10000,

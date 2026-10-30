@@ -21,7 +21,7 @@ import type {
 } from '../../core/types.js';
 import type { CodeMieConfigOptions, CodeMieIntegrationInfo } from '../../../env/types.js';
 import { ProviderRegistry } from '../../core/registry.js';
-import { CodeMieSSO } from './sso.auth.js';
+import { CodeMieSSO, hasUsableSsoCredential } from './sso.auth.js';
 import { effectiveExpiresAt } from './sso.expiry.js';
 import { SSOModelProxy } from './sso.models.js';
 import { fetchCodeMieModels, fetchCodeMieIntegrations } from './sso.http-client.js';
@@ -58,15 +58,16 @@ export async function selectIntegrationForProject(
   apiUrl: string,
   cookies: Record<string, string>,
   project: string | undefined,
-  options: { onFetchError?: 'none' | 'throw' } = {}
+  options: { onFetchError?: 'none' | 'throw' } = {},
+  authorization?: string
 ): Promise<CodeMieIntegrationInfo | undefined> {
   let integrations;
   let integrationsFetchError: string | undefined;
 
   const integrationsSpinner = ora('Fetching user integrations...').start();
   try {
-    // Use the caller's cookies directly (same as the userInfo fetch) instead of retrieving from storage
-    const allIntegrations = await fetchCodeMieIntegrations(apiUrl, cookies);
+    // Use the caller's cookies/authorization directly (same as the userInfo fetch) instead of retrieving from storage
+    const allIntegrations = await fetchCodeMieIntegrations(apiUrl, cookies, undefined, authorization);
 
     integrationsSpinner.stop();
 
@@ -147,10 +148,12 @@ export const SSOSetupSteps: ProviderSetupSteps = {
     try {
       console.log(chalk.cyan('📂 Fetching available projects...\n'));
 
-      // Ensure API URL and cookies are available
-      if (!authResult.apiUrl || !authResult.cookies) {
-        throw new Error('API URL or cookies not found in authentication result');
+      // Ensure API URL and a usable credential (cookies, or the authorization
+      // fallback) are available
+      if (!authResult.apiUrl || !hasUsableSsoCredential(authResult.cookies, authResult.authorization)) {
+        throw new Error('API URL or cookies/authorization not found in authentication result');
       }
+      authResult.cookies = authResult.cookies ?? {};
 
       ({ project: selectedProject, userEmail: selectedUserEmail } = await selectCodeMieProject(authResult));
     } catch (error) {
@@ -161,7 +164,13 @@ export const SSOSetupSteps: ProviderSetupSteps = {
       throw new Error(`Project selection required: ${errorMsg}`);
     }
 
-    const integrationInfo = await selectIntegrationForProject(authResult.apiUrl, authResult.cookies, selectedProject);
+    const integrationInfo = await selectIntegrationForProject(
+      authResult.apiUrl,
+      authResult.cookies,
+      selectedProject,
+      {},
+      authResult.authorization
+    );
 
     return {
       baseUrl: authResult.apiUrl,
@@ -174,7 +183,8 @@ export const SSOSetupSteps: ProviderSetupSteps = {
         // Reused by fetchModels() below so it hits the API with the same
         // authenticated session instead of re-resolving credentials from
         // storage (which can race with the credential store write on Windows).
-        cookies: authResult.cookies
+        cookies: authResult.cookies,
+        authorization: authResult.authorization
       }
     };
   },
@@ -250,7 +260,7 @@ export const SSOSetupSteps: ProviderSetupSteps = {
       // Test API access
       try {
         // Only checks that the session can read the catalog; no project narrowing needed.
-        await fetchCodeMieModels(credentials.apiUrl, credentials.cookies, undefined);
+        await fetchCodeMieModels(credentials.apiUrl, credentials.cookies, undefined, credentials.authorization);
       } catch (error) {
         return {
           valid: false,

@@ -56,7 +56,12 @@ export async function fetchCodeMieCatalogForEnv(
   const found = await getStoredPlatformCredentialsFromEnv(env);
   if (found) {
     logger.debug(`${logPrefix} Fetching CodeMie model list via SSO auth`, { project });
-    return fetchCodeMieLlmModels(found.credentials.apiUrl, found.credentials.cookies, project);
+    return fetchCodeMieLlmModels(
+      found.credentials.apiUrl,
+      found.credentials.cookies,
+      project,
+      found.credentials.authorization
+    );
   }
 
   const platformUrl = getPlatformUrlFromEnv(env);
